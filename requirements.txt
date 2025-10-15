@@ -1,0 +1,6 @@
+openai-whisper
+pyaudio
+pyperclip
+pynput
+pyyaml
+pyinstaller

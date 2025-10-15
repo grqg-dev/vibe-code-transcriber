@@ -1,0 +1,28 @@
+# Voice Transcriber Configuration
+
+# Whisper model to use
+# Options: tiny.en, base.en, small.en, medium.en, large
+# Smaller = faster, larger = more accurate
+whisper_model: "base.en"
+
+# Auto-paste transcription after copying to clipboard
+auto_paste: true
+
+# Audio beep feedback when starting/stopping recording
+audio_feedback: true
+
+# Volume attenuation during recording (reduces background music/audio interference)
+attenuate_volume: true
+# Percentage to reduce volume to during recording (default: 10%)
+attenuation_percent: 10
+
+# Hotkey configuration (advanced users only)
+# Default: 176 (macOS dictation key)
+# Run detect_key.py to find custom key codes
+hotkey_code: 176
+
+# Audio recording settings
+audio:
+  sample_rate: 16000
+  channels: 1
+  chunk_size: 1024
