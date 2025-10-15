@@ -79,11 +79,11 @@ echo -e "${BLUE}📋 Step 3: Installing Python dependencies...${NC}"
 echo
 
 # Upgrade pip
-pip install --upgrade pip --quiet
+pip3 install --upgrade pip --quiet
 
 # Install requirements
 echo "Installing Python packages (this may take a few minutes)..."
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 
 echo -e "${GREEN}✅ All Python dependencies installed${NC}"
 
