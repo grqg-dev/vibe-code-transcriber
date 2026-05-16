@@ -1,0 +1,156 @@
+# CLAUDE.md
+
+Push-to-talk voice transcriber, macOS Apple Silicon only. Single Python file
+(`transcribe.py`) + YAML config. ASR via [parakeet-mlx][parakeet-mlx]
+(deliberately not NeMo/PyTorch — much lighter install, faster cold start).
+See [`README.md`](README.md) for the user view.
+
+[parakeet-mlx]: https://github.com/senstella/parakeet-mlx
+
+## Don't break these invariants
+
+Each one was a real bug in a prior iteration.
+
+1. **MLX runs only on the worker thread (`_transcription_worker`).** Loading
+   or calling the model from any other thread crashes with
+   `RuntimeError: There is no Stream(gpu, 0) in current thread.` MLX binds
+   GPU streams per-thread. To transcribe, **always** enqueue a WAV path on
+   `self._transcription_queue` — never call `_transcribe_file` directly.
+
+2. **One PyAudio instance, `self.audio`, for the whole process.** Don't
+   construct a new `pyaudio.PyAudio()` anywhere (especially not in
+   `play_beep`). A second PA session re-inits CoreAudio and visibly
+   glitches the live input stream. The beep reuses `self.audio` with
+   `output=True`.
+
+3. **The mic input stream is opened once in `run()` and held open until
+   exit.** Reopening per keypress costs 100-300 ms of dead air during which
+   the beep already fired — early words get clipped. The tradeoff is a
+   permanent macOS recording-indicator (intentional).
+
+4. **`is_recording` is the sole gate on capture.** `_capture_loop` runs
+   forever (until `_capture_running` flips false at shutdown), reading
+   every ~64 ms; it appends to `audio_data` only when `is_recording` is
+   True. Do not add a second flag.
+
+5. **All spawned threads are `daemon=True`.** pynput's Quartz event tap on
+   macOS can swallow SIGINT before it reaches the Python main thread.
+   Daemon threads guarantee the process actually exits.
+
+6. **Block on `self._model_ready.wait()` before showing "Ready".** Users
+   must not be able to press the hotkey before the worker has loaded +
+   warmed up the model.
+
+## Commands
+
+```bash
+# parse + import sanity (always run after editing transcribe.py)
+python3 -c "import ast; ast.parse(open('transcribe.py').read())"
+
+# run
+./run.sh           # normal
+./run.sh -v        # verbose: prints every keypress, beep, stream open, worker step
+
+# escape hatch if a hung listener won't die
+pkill -9 -f transcribe.py
+
+# reproduce invariant #1 (MLX threading) — confirms it's still real
+source venv/bin/activate && python3 <<'PY'
+import threading
+from parakeet_mlx import from_pretrained
+m = from_pretrained('mlx-community/parakeet-tdt-0.6b-v3')
+err = []
+def x():
+    try: m.transcribe('debug_audio/<any-existing>.wav')
+    except Exception as e: err.append(type(e).__name__)
+threading.Thread(target=x).start(); err and print(err)  # expect ['RuntimeError']
+PY
+
+# end-to-end inference smoke (after install, not in CI)
+source venv/bin/activate && python3 -c "
+from parakeet_mlx import from_pretrained
+r = from_pretrained('mlx-community/parakeet-tdt-0.6b-v3').transcribe('debug_audio/<any>.wav')
+print(repr(r.text))
+"
+```
+
+## File map
+
+| File | Role |
+|---|---|
+| `transcribe.py` | The entire app: `VoiceTranscriber` class. |
+| `config.yaml` | Runtime config. Loaded once. |
+| `detect_key.py` | Standalone: prints what pynput sees for any keypress. Use when the configured `hotkey_code` doesn't match what the user's key emits. |
+| `install.sh` | brew + venv + `pip install -r requirements.txt`. |
+| `run.sh` | `venv/bin/python3 transcribe.py "$@"`. Forwards args. |
+| `build.sh` | PyInstaller bundle into `dist/VoiceTranscriber`. Hidden-imports `parakeet_mlx`, `mlx`. |
+| `debug_audio/` | Per-recording WAV dumps. Gitignored. |
+
+No tests. Smoke commands above are the closest substitute.
+
+## Threading model
+
+```
+main thread             listener thread        capture thread         worker thread
+─────────────           ────────────────       ────────────────       ──────────────
+run()                   on_press/on_release    _capture_loop          _transcription_worker
+- open mic stream       - flip is_recording    - stream.read() loop   - load_model (MLX)
+- spawn capture thread  - write WAV            - append if recording  - warmup_model
+- spawn worker thread   - enqueue WAV path     - else discard         - process queue forever
+- start pynput listener
+- install SIGINT
+```
+
+## Control flow
+
+Press: `on_press` → `start_recording` flips `is_recording=True` and spawns a
+fire-and-forget beep thread. The capture thread (already running) starts
+appending chunks on its next ~64 ms read tick.
+
+Release: `on_release` → `stop_recording` flips the flag off, restores
+volume, fires stop-beep, calls `transcribe_audio` which writes a temp WAV,
+copies it to `debug_audio/`, and puts the path on `_transcription_queue`.
+
+Worker: pulls path → `_transcribe_file` → prints, copies to clipboard,
+simulates ⌘V (if `auto_paste`), deletes temp WAV. The `debug_audio/` copy
+stays for later inspection.
+
+Shutdown: SIGINT/SIGTERM handler flips `_capture_running=False` and calls
+`listener.stop()`; `run()`'s cleanup closes the stream and terminates
+PyAudio. Daemon threads die with the process.
+
+## Known soft spots
+
+- **Volume attenuation reset is fragile.** `restore_system_volume` only
+  works if `original_volume` was captured at recording start, and there's
+  no recovery if the process dies mid-recording. The user has flagged this
+  as "fuckety." A fix probably caches the volume once at startup and always
+  restores to that on stop / on exit / on SIGINT.
+- **`_real_time_transcribe` violates invariant #1.** It calls
+  `_transcribe_file` from its own thread instead of routing through the
+  worker queue. It mostly works because the worker hasn't necessarily
+  touched MLX yet when real-time loads it first, but it's fragile. Route
+  it through the queue if you touch real-time mode.
+- **PyInstaller bundle may miss MLX native dylibs.** `build.sh` uses
+  `--collect-all mlx parakeet_mlx`; verify the binary actually loads
+  before shipping.
+
+## Conventions
+
+- **One file.** Add functions to `transcribe.py`. Don't split.
+- **Comments document WHY, not WHAT.** Existing code follows this. Match it.
+- **No logging framework.** `print(..., flush=True)` for user output;
+  `dbg(...)` for `--verbose` traces. Keep the emoji prefixes
+  (`🎙️ ⏹️ 📝 🔍 🐛 ⚠️ ❌ ✅`) — they're part of the UX.
+- **Heavy imports go inside `load_model`.** Keep argparse / `--help` snappy.
+- **Don't add cloud fallback / API providers.** Being 100% local is the point.
+- **Don't reformat the whole file.** Comment style and structure are deliberate.
+- **Don't commit `debug_audio/`** (it's gitignored).
+- **Don't `pip uninstall` leftover NeMo/torch from a prior branch.** Bloat
+  but harmless. `rm -rf venv && ./install.sh` to clean.
+
+## Pointers
+
+- MLX: https://ml-explore.github.io/mlx/build/html/index.html
+- parakeet-mlx: https://github.com/senstella/parakeet-mlx
+- pynput macOS quirks: https://pynput.readthedocs.io/en/latest/limitations.html

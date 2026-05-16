@@ -1,5 +1,4 @@
-nemo_toolkit[asr]
-torch
+parakeet-mlx
 pyaudio
 pyperclip
 pynput

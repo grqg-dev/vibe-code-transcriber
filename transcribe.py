@@ -2,6 +2,7 @@
 """
 Voice Transcriber - Push-to-talk terminal transcription tool
 Hold dictation key to record, release to transcribe with NVIDIA Parakeet
+running natively on Apple Silicon via the MLX framework (parakeet-mlx).
 """
 
 import pyaudio
@@ -20,13 +21,36 @@ from datetime import datetime, timedelta
 from queue import Queue
 import numpy as np
 import argparse
+import atexit
 import subprocess
 import platform
 import logging
+import signal
+import warnings
 
-# Silence NeMo's verbose logging so it doesn't clobber the terminal UI
-logging.getLogger("nemo_logger").setLevel(logging.ERROR)
-os.environ.setdefault("NEMO_LOGGING_LEVEL", "ERROR")
+# Quiet the noisy stuff parakeet-mlx / huggingface_hub emit on import & load.
+# These need to be set BEFORE the heavy import happens inside load_model().
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("PYTHONWARNINGS", "ignore")
+# Keep HF download progress bars visible — they're useful on first run.
+
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# Verbose debug logging — toggle with --verbose flag or VERBOSE=1 env var
+VERBOSE = os.environ.get("VERBOSE", "0") == "1"
+
+
+def dbg(msg):
+    """Print a debug line if VERBOSE is on. Flushes immediately."""
+    if VERBOSE:
+        print(f"🐛 [debug] {msg}", flush=True)
 
 
 class VoiceTranscriber:
@@ -64,12 +88,22 @@ class VoiceTranscriber:
         self.model = None
         self.model_name = self.config['parakeet_model']
 
-        # Thread for recording
-        self.record_thread = None
+        # Persistent input stream (opened in run())
         self.stream = None
 
-        # Hotkey for recording from config
-        self.record_key = KeyCode.from_vk(self.config['hotkey_code'])
+        # Hotkey for recording from config.
+        # Supports both numeric VK codes (e.g. 176) and pynput Key names (e.g. 'alt_r').
+        hotkey_config = self.config['hotkey_code']
+        if isinstance(hotkey_config, str):
+            try:
+                self.record_key = getattr(Key, hotkey_config)
+            except AttributeError:
+                print(f"❌ Unknown key name: {hotkey_config!r}", flush=True)
+                print(f"   Use a numeric VK code or a valid pynput Key name "
+                      f"(e.g. 'alt_r', 'shift', 'ctrl', 'cmd', 'f13').", flush=True)
+                sys.exit(1)
+        else:
+            self.record_key = KeyCode.from_vk(hotkey_config)
 
         # Keyboard controller for auto-paste
         self.kb_controller = Controller()
@@ -78,10 +112,42 @@ class VoiceTranscriber:
         self.auto_paste = self.config['auto_paste']
         self.audio_feedback = self.config['audio_feedback']
 
-        # Volume attenuation
+        # Volume attenuation.
+        # Capture the baseline ONCE at startup and always restore to it. The
+        # previous "capture at attenuate, restore at stop" model raced badly:
+        # on a fast tap, restore ran before the post-beep attenuate, leaving
+        # the volume stuck low forever. With a fixed baseline + lock, restore
+        # is always meaningful and idempotent.
         self.attenuate_volume = self.config.get('attenuate_volume', True)
         self.attenuation_percent = self.config.get('attenuation_percent', 10)
-        self.original_volume = None
+        self._volume_lock = threading.Lock()
+        self._baseline_volume = self.get_system_volume() if self.attenuate_volume else None
+        if self._baseline_volume is not None:
+            dbg(f"baseline system volume captured at startup: {self._baseline_volume}%")
+            # Last-ditch safety: if the program dies in any way that doesn't
+            # go through our cleanup paths, atexit still fires and the user's
+            # speakers don't stay stuck at 10%.
+            atexit.register(self.restore_system_volume)
+
+        # Debug audio dump (helps verify mic actually captured something)
+        self.should_save_debug_audio = self.config.get('save_debug_audio', True)
+        self.debug_audio_dir = Path(__file__).parent / "debug_audio"
+        if self.should_save_debug_audio:
+            self.debug_audio_dir.mkdir(exist_ok=True)
+
+        # MLX GPU streams are per-thread, so all model load/inference work has
+        # to happen on a single dedicated worker thread. The pynput listener
+        # callback runs on its own thread and cannot touch the model directly.
+        self._transcription_queue = Queue()
+        self._worker_thread = None
+        self._model_ready = threading.Event()
+
+        # Persistent mic capture: open once at startup, run forever, gate
+        # append-to-buffer with is_recording. This makes the beep a true
+        # "now recording" cue with zero key-press → audio-on latency, and
+        # avoids the CoreAudio reconfigure that an on-press open caused.
+        self._capture_thread = None
+        self._capture_running = False
 
     def load_config(self, config_path):
         """Load configuration from YAML file"""
@@ -100,10 +166,11 @@ class VoiceTranscriber:
     def get_default_config(self):
         """Return default configuration"""
         return {
-            'parakeet_model': 'nvidia/parakeet-tdt-0.6b-v2',
+            'parakeet_model': 'mlx-community/parakeet-tdt-0.6b-v3',
             'auto_paste': True,
             'audio_feedback': True,
-            'hotkey_code': 176,
+            'hotkey_code': 'alt_r',
+            'save_debug_audio': True,
             'audio': {
                 'sample_rate': 16000,
                 'channels': 1,
@@ -112,32 +179,36 @@ class VoiceTranscriber:
         }
 
     def play_beep(self, frequency=800, duration=0.1):
-        """Play a beep sound for audio feedback"""
+        """Play a beep sound for audio feedback.
+
+        Uses the shared `self.audio` PyAudio instance — creating a fresh
+        `pyaudio.PyAudio()` here causes CoreAudio on macOS to reconfigure
+        the audio session and visibly glitch the live input stream.
+        """
         if not self.audio_feedback:
+            dbg(f"play_beep({frequency}Hz) skipped — audio_feedback disabled")
             return
 
+        dbg(f"play_beep({frequency}Hz, {duration}s) starting")
         try:
-            import numpy as np
             sample_rate = 44100
             samples = int(sample_rate * duration)
             t = np.linspace(0, duration, samples, False)
             wave_data = np.sin(frequency * 2 * np.pi * t)
-            # Much quieter beep (about 10% volume)
             audio_data = (wave_data * 3000).astype(np.int16)
 
-            # Play using PyAudio
-            p = pyaudio.PyAudio()
-            stream = p.open(format=pyaudio.paInt16,
-                          channels=1,
-                          rate=sample_rate,
-                          output=True)
+            stream = self.audio.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=sample_rate,
+                output=True,
+            )
             stream.write(audio_data.tobytes())
             stream.stop_stream()
             stream.close()
-            p.terminate()
+            dbg(f"play_beep({frequency}Hz) finished")
         except Exception as e:
-            # Silently fail if beep doesn't work
-            pass
+            print(f"⚠️  Beep failed ({frequency}Hz): {type(e).__name__}: {e}", flush=True)
 
     def get_system_volume(self):
         """Get current system volume (macOS only)"""
@@ -174,22 +245,28 @@ class VoiceTranscriber:
             return False
 
     def attenuate_system_volume(self):
-        """Lower system volume to attenuation_percent of original"""
-        if not self.attenuate_volume:
-            return
+        """Lower system volume to attenuation_percent of the baseline.
 
-        self.original_volume = self.get_system_volume()
-        if self.original_volume is not None:
-            target_volume = int(self.original_volume * (self.attenuation_percent / 100.0))
+        Bails out if we're no longer recording, so a fast tap-and-release
+        followed by a post-beep attenuate doesn't strand the volume low.
+        """
+        if not self.attenuate_volume or self._baseline_volume is None:
+            return
+        with self._volume_lock:
+            if not self.is_recording:
+                dbg("attenuate skipped — no longer recording (race avoided)")
+                return
+            target_volume = int(self._baseline_volume * (self.attenuation_percent / 100.0))
             self.set_system_volume(target_volume)
+            dbg(f"attenuated volume: {self._baseline_volume}% → {target_volume}%")
 
     def restore_system_volume(self):
-        """Restore system volume to original level"""
-        if not self.attenuate_volume or self.original_volume is None:
+        """Restore system volume to the program-start baseline. Idempotent."""
+        if not self.attenuate_volume or self._baseline_volume is None:
             return
-
-        self.set_system_volume(self.original_volume)
-        self.original_volume = None
+        with self._volume_lock:
+            self.set_system_volume(self._baseline_volume)
+            dbg(f"restored volume to baseline: {self._baseline_volume}%")
 
     def check_microphone_access(self):
         """Check if microphone is accessible"""
@@ -207,54 +284,99 @@ class VoiceTranscriber:
             return False
 
     def load_model(self):
-        """Load NVIDIA Parakeet ASR model (this will download on first run)"""
+        """Load Parakeet ASR model via MLX (downloads on first run)."""
         if self.model is not None:
+            dbg("load_model: model already loaded, skipping")
             return
 
-        print(f"⏳ Loading NVIDIA Parakeet model '{self.model_name}'...")
-        print("   (This may take a moment on first run — model is ~600MB-2GB)")
+        print(f"⏳ Loading Parakeet (MLX) model '{self.model_name}'...", flush=True)
+        print("   (First run downloads ~600MB — may take a minute)", flush=True)
+
+        t0 = time.time()
         try:
-            import nemo.collections.asr as nemo_asr
-            self.model = nemo_asr.models.ASRModel.from_pretrained(
-                model_name=self.model_name
-            )
-            self.model.eval()
-            print("✅ Model loaded successfully!\n")
+            print("   → importing parakeet_mlx ...", flush=True)
+            t_import = time.time()
+            from parakeet_mlx import from_pretrained
+            dbg(f"parakeet_mlx import took {time.time() - t_import:.1f}s")
+
+            print("   → fetching / loading model weights ...", flush=True)
+            t_load = time.time()
+            self.model = from_pretrained(self.model_name)
+            dbg(f"from_pretrained took {time.time() - t_load:.1f}s")
+
+            print(f"✅ Model loaded successfully in {time.time() - t0:.1f}s\n", flush=True)
         except Exception as e:
-            print(f"❌ Error loading Parakeet model: {e}")
-            print("   Check your internet connection and that nemo_toolkit is installed.")
+            print(f"❌ Error loading Parakeet model: {type(e).__name__}: {e}", flush=True)
+            print("   Check your internet connection and that parakeet-mlx is installed.", flush=True)
+            print("   pip install: pip install parakeet-mlx -U", flush=True)
+            if VERBOSE:
+                import traceback
+                traceback.print_exc()
             sys.exit(1)
 
+    def warmup_model(self):
+        """Run one short inference so the first real transcribe isn't slow."""
+        if self.model is None:
+            return
+        try:
+            print("🔥 Warming up model (1s of silence)...", flush=True)
+            t0 = time.time()
+            silence = np.zeros(self.RATE, dtype=np.int16)  # 1s of silence at sample rate
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = tmp.name
+            wf = wave.open(tmp_path, 'wb')
+            wf.setnchannels(self.CHANNELS)
+            wf.setsampwidth(2)
+            wf.setframerate(self.RATE)
+            wf.writeframes(silence.tobytes())
+            wf.close()
+            try:
+                self._transcribe_file(tmp_path)
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            print(f"✅ Model warm ({time.time() - t0:.1f}s)\n", flush=True)
+        except Exception as e:
+            print(f"⚠️  Warmup failed (non-fatal): {type(e).__name__}: {e}", flush=True)
+
     def _transcribe_file(self, wav_path):
-        """Run Parakeet inference on a WAV file and return the text."""
-        output = self.model.transcribe([wav_path])
-        # NeMo returns either a list of strings or a list of Hypothesis objects
-        # depending on version / model type. Handle both shapes.
-        if not output:
-            return ""
-        first = output[0]
-        if isinstance(first, list):  # some models return [[hyp], ...]
-            first = first[0] if first else ""
-        if hasattr(first, 'text'):
-            return first.text.strip()
-        return str(first).strip()
+        """Run Parakeet (MLX) inference on a WAV file and return the text."""
+        result = self.model.transcribe(wav_path)
+        # parakeet-mlx returns an AlignedResult with a `.text` attribute.
+        # Fall back to str() in case the API ever yields a bare string.
+        if hasattr(result, "text"):
+            return (result.text or "").strip()
+        return str(result).strip()
 
     def start_recording(self):
-        """Start recording audio from microphone"""
+        """Begin recording. Mic stream is already live — just flip the flag."""
+        dbg("start_recording called")
         if self.is_recording:
+            dbg("start_recording: already recording, ignoring")
             return
 
-        self.is_recording = True
+        # Reset buffers BEFORE flipping the flag so the capture loop can't
+        # append onto a stale audio_data list.
         self.audio_data = []
         self.record_start_time = time.time()
         self.last_transcribed_text = ""
+        if self.real_time_mode:
+            # Drain any stale queued chunks from the previous session.
+            while not self.data_queue.empty():
+                try:
+                    self.data_queue.get_nowait()
+                except Exception:
+                    break
+        self.is_recording = True
 
-        # Play start beep, then attenuate volume
-        def beep_then_attenuate():
-            self.play_beep(800, 0.1)
-            self.attenuate_system_volume()
-
-        threading.Thread(target=beep_then_attenuate).start()
+        if self.real_time_mode:
+            self.transcription_thread = threading.Thread(
+                target=self._real_time_transcribe, daemon=True
+            )
+            self.transcription_thread.start()
+            dbg("real-time transcription thread started")
 
         if self.real_time_mode:
             print("\n" + "─" * 60)
@@ -266,43 +388,47 @@ class VoiceTranscriber:
             print("─" * 60)
         sys.stdout.flush()
 
-        try:
-            self.stream = self.audio.open(
-                format=self.FORMAT,
-                channels=self.CHANNELS,
-                rate=self.RATE,
-                input=True,
-                frames_per_buffer=self.CHUNK
-            )
+        # Beep + attenuate run async so they don't delay anything. The mic is
+        # ALREADY hot, so the beep is a truthful "now recording" cue.
+        def beep_then_attenuate():
+            dbg("beep_then_attenuate thread started")
+            self.play_beep(800, 0.1)
+            self.attenuate_system_volume()
+            dbg("beep_then_attenuate thread done")
 
-            # Record in a separate thread
-            self.record_thread = threading.Thread(target=self._record_audio)
-            self.record_thread.start()
+        threading.Thread(target=beep_then_attenuate, daemon=True).start()
 
-            # Start real-time transcription thread if in real-time mode
-            if self.real_time_mode:
-                self.transcription_thread = threading.Thread(target=self._real_time_transcribe)
-                self.transcription_thread.start()
+    def _capture_loop(self):
+        """Persistent mic reader.
 
-        except Exception as e:
-            print(f"❌ Error starting recording: {e}")
-            print("   Check System Preferences → Privacy & Security → Microphone")
-            self.is_recording = False
-
-    def _record_audio(self):
-        """Internal method to record audio in a thread"""
-        while self.is_recording:
+        Runs from `run()` until the process exits. Always drains the input
+        stream so the OS buffer never backs up, but only appends to
+        `self.audio_data` when `is_recording` is True. This means key-press
+        latency is essentially zero — we don't pay for opening the stream
+        on press, and there's no glitch from CoreAudio reconfiguring.
+        """
+        dbg("_capture_loop entered")
+        chunks_appended = 0
+        while self._capture_running:
             try:
                 data = self.stream.read(self.CHUNK, exception_on_overflow=False)
-                if self.real_time_mode:
-                    # Put data in queue for real-time processing
-                    self.data_queue.put(data)
-                else:
-                    # Store all data for batch processing
-                    self.audio_data.append(data)
             except Exception as e:
-                print(f"❌ Error during recording: {e}")
+                if self._capture_running:
+                    print(f"❌ Error during capture: {type(e).__name__}: {e}", flush=True)
+                    if VERBOSE:
+                        import traceback
+                        traceback.print_exc()
                 break
+
+            if not self.is_recording:
+                continue
+
+            if self.real_time_mode:
+                self.data_queue.put(data)
+            else:
+                self.audio_data.append(data)
+                chunks_appended += 1
+        dbg(f"_capture_loop exited ({chunks_appended} chunks captured this session)")
 
     def _real_time_transcribe(self):
         """Real-time transcription thread - processes audio as it comes in"""
@@ -340,8 +466,8 @@ class VoiceTranscriber:
                     audio_duration = len(phrase_bytes) / (2 * self.CHANNELS * self.RATE)  # 2 bytes per sample
 
                     if audio_duration >= min_audio_length and time_since_phrase_start >= record_timeout:
-                        # Parakeet (via NeMo) transcribes from WAV files, so dump
-                        # the accumulated phrase to a temporary file each pass.
+                        # parakeet-mlx transcribes from a file path, so dump the
+                        # accumulated phrase to a temporary WAV each pass.
                         try:
                             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                                 tmp_path = tmp.name
@@ -409,122 +535,180 @@ class VoiceTranscriber:
                     break
 
     def stop_recording(self):
-        """Stop recording and transcribe"""
+        """Stop recording and hand the buffer off to the transcription worker."""
+        dbg("stop_recording called")
         if not self.is_recording:
+            dbg("stop_recording: not recording, ignoring")
             return
 
         self.is_recording = False
         duration = time.time() - self.record_start_time
 
-        # Wait for recording thread to finish
-        if self.record_thread:
-            self.record_thread.join()
-
-        # Stop and close stream
-        if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-
-        # Restore system volume
+        # Restore system volume immediately so the user hears the beep at
+        # their normal level.
         self.restore_system_volume()
 
-        # Play stop beep
-        threading.Thread(target=lambda: self.play_beep(600, 0.1)).start()
+        # Stop beep async — doesn't affect capture; mic stays open.
+        threading.Thread(target=lambda: self.play_beep(600, 0.1), daemon=True).start()
 
         print(f"⏹️  Stopped recording ({duration:.1f}s)")
 
         if self.real_time_mode:
-            # Wait for transcription thread to finish processing
             if self.transcription_thread:
                 print("⏳ Finishing transcription...")
                 sys.stdout.flush()
-                self.transcription_thread.join(timeout=5.0)  # Wait up to 5 seconds
+                self.transcription_thread.join(timeout=5.0)
                 print("─" * 60 + "\n")
         else:
-            # Regular mode - transcribe after recording
-            print("⏳ Processing transcription...")
-            sys.stdout.flush()
-
-            # Save to temporary file
             if self.audio_data:
                 self.transcribe_audio()
             else:
                 print("❌ No audio recorded\n")
 
     def transcribe_audio(self):
-        """Transcribe the recorded audio using NVIDIA Parakeet"""
-        # Create temporary file
+        """Write the recorded audio to WAV and hand it off to the worker.
+
+        Runs on the listener thread (because stop_recording is invoked from
+        on_release). Doing the actual MLX call here would crash because MLX
+        streams are per-thread — see _transcription_worker.
+        """
+        raw_bytes = b''.join(self.audio_data)
+        sample_width = self.audio.get_sample_size(self.FORMAT)
+        audio_seconds = len(raw_bytes) / (sample_width * self.CHANNELS * self.RATE)
+        print(
+            f"🎙️  Recorded {audio_seconds:.1f}s of audio "
+            f"({len(raw_bytes) / 1024:.1f} kB, {len(self.audio_data)} chunks)",
+            flush=True,
+        )
+
+        # Write to a temp WAV that the worker will transcribe and then delete.
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
             temp_filename = temp_file.name
-
-            # Write audio data to file
+        try:
             wf = wave.open(temp_filename, 'wb')
             wf.setnchannels(self.CHANNELS)
-            wf.setsampwidth(self.audio.get_sample_size(self.FORMAT))
+            wf.setsampwidth(sample_width)
             wf.setframerate(self.RATE)
-            wf.writeframes(b''.join(self.audio_data))
+            wf.writeframes(raw_bytes)
             wf.close()
+        except Exception as e:
+            print(f"❌ Failed to write recording WAV: {type(e).__name__}: {e}", flush=True)
+            return
 
+        # Persist a copy under debug_audio/ so we can inspect what the model heard.
+        if self.should_save_debug_audio:
+            debug_path = self.debug_audio_dir / (
+                f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+            )
             try:
-                # Load model if not already loaded
-                self.load_model()
-
-                # Transcribe
-                start_time = time.time()
-                text = self._transcribe_file(temp_filename)
-                transcribe_time = time.time() - start_time
-
-                if text:
-                    # Print the transcription with nice formatting
-                    print("\n" + "═" * 60)
-                    print("📝 TRANSCRIPTION")
-                    print("═" * 60)
-                    print(f"{text}")
-                    print("═" * 60)
-                    print(f"⏱️  Transcribed in {transcribe_time:.1f}s")
-
-                    # Copy to clipboard
-                    try:
-                        pyperclip.copy(text)
-                        print("✅ Copied to clipboard")
-                    except Exception as e:
-                        print(f"⚠️  Could not copy to clipboard: {e}")
-
-                    # Auto-paste if enabled
-                    if self.auto_paste:
-                        try:
-                            time.sleep(0.2)
-                            with self.kb_controller.pressed(Key.cmd):
-                                self.kb_controller.press('v')
-                                self.kb_controller.release('v')
-                            print("✅ Auto-pasted")
-                        except Exception as e:
-                            print(f"⚠️  Could not auto-paste: {e}")
-                            print("   Enable Accessibility permissions in System Preferences")
-
-                    print("─" * 60 + "\n")
-                else:
-                    print("⚠️  No speech detected in audio\n")
-
+                with open(temp_filename, 'rb') as src, open(debug_path, 'wb') as dst:
+                    dst.write(src.read())
+                print(f"🔍 Debug audio saved: {debug_path}", flush=True)
             except Exception as e:
-                print(f"❌ Error transcribing: {e}\n")
+                dbg(f"failed to write debug audio: {type(e).__name__}: {e}")
+
+        dbg(f"enqueuing transcription job: {temp_filename}")
+        self._transcription_queue.put(temp_filename)
+
+    def _transcription_worker(self):
+        """Dedicated thread that owns the MLX model and runs all inference.
+
+        MLX GPU streams are per-thread, so the model must be loaded and used
+        from one consistent thread. Producers (the recording flow) hand us
+        WAV paths via self._transcription_queue.
+        """
+        dbg("transcription worker thread starting")
+        try:
+            self.load_model()
+            self.warmup_model()
+        except SystemExit:
+            self._model_ready.set()
+            return
+        except Exception as e:
+            print(f"❌ Worker failed during model setup: {type(e).__name__}: {e}", flush=True)
+            if VERBOSE:
                 import traceback
                 traceback.print_exc()
+            self._model_ready.set()
+            return
+        self._model_ready.set()
+        dbg("transcription worker ready")
 
+        while True:
+            wav_path = self._transcription_queue.get()
+            if wav_path is None:
+                dbg("transcription worker got shutdown sentinel")
+                break
+            try:
+                self._process_transcription(wav_path)
+            except Exception as e:
+                print(f"❌ Worker transcription error: {type(e).__name__}: {e}", flush=True)
+                if VERBOSE:
+                    import traceback
+                    traceback.print_exc()
             finally:
-                # Clean up temp file
                 try:
-                    os.remove(temp_filename)
-                except:
+                    os.remove(wav_path)
+                except OSError:
                     pass
+
+    def _process_transcription(self, wav_path):
+        """Run inference on a WAV path and emit text + clipboard + paste."""
+        print("⏳ Processing transcription...", flush=True)
+        start_time = time.time()
+        text = self._transcribe_file(wav_path)
+        transcribe_time = time.time() - start_time
+
+        if not text:
+            print("⚠️  No speech detected in audio\n", flush=True)
+            return
+
+        print("\n" + "═" * 60)
+        print("📝 TRANSCRIPTION")
+        print("═" * 60)
+        print(text)
+        print("═" * 60)
+        print(f"⏱️  Transcribed in {transcribe_time:.1f}s")
+
+        try:
+            pyperclip.copy(text)
+            print("✅ Copied to clipboard")
+        except Exception as e:
+            print(f"⚠️  Could not copy to clipboard: {e}")
+
+        if self.auto_paste:
+            try:
+                time.sleep(0.2)
+                with self.kb_controller.pressed(Key.cmd):
+                    self.kb_controller.press('v')
+                    self.kb_controller.release('v')
+                print("✅ Auto-pasted")
+            except Exception as e:
+                print(f"⚠️  Could not auto-paste: {e}")
+                print("   Enable Accessibility permissions in System Preferences")
+
+        print("─" * 60 + "\n", flush=True)
+
+    def _describe_key(self, key):
+        """Return a human-readable description of a pynput key for debug logging."""
+        try:
+            if isinstance(key, KeyCode):
+                return f"KeyCode(vk={key.vk}, char={key.char!r})"
+            return f"Key.{getattr(key, 'name', repr(key))}"
+        except Exception:
+            return repr(key)
 
     def on_press(self, key):
         """Callback for key press events"""
+        if VERBOSE:
+            dbg(f"on_press: {self._describe_key(key)} (target={self._describe_key(self.record_key)})")
         if key == self.record_key:
             self.start_recording()
 
     def on_release(self, key):
         """Callback for key release events"""
+        if VERBOSE:
+            dbg(f"on_release: {self._describe_key(key)}")
         if key == self.record_key:
             self.stop_recording()
 
@@ -556,32 +740,106 @@ class VoiceTranscriber:
         print("\n💡 Tip: Run detect_key.py to find your key code")
 
         # Check microphone access
-        print("\n🔍 Checking microphone access...")
+        print("\n🔍 Checking microphone access...", flush=True)
         if self.check_microphone_access():
-            print("✅ Microphone is accessible")
+            print("✅ Microphone is accessible", flush=True)
         else:
-            print("❌ Cannot access microphone!")
-            print("   Go to: System Preferences → Privacy & Security → Microphone")
-            print("   Enable access for Terminal (or your terminal app)")
+            print("❌ Cannot access microphone!", flush=True)
+            print("   Go to: System Preferences → Privacy & Security → Microphone", flush=True)
+            print("   Enable access for Terminal (or your terminal app)", flush=True)
             sys.exit(1)
 
-        print("\n" + "═" * 60)
-        print("✅ Ready! Press and hold the dictation key to start...")
-        print("═" * 60 + "\n")
+        # Open the mic ONCE and hold it open for the lifetime of the program.
+        # Trades a persistent macOS recording-indicator for zero latency on
+        # key press — the beep then truthfully signals "we're recording right
+        # now" rather than firing during pyaudio's 100-300 ms cold open.
+        try:
+            dbg(f"opening persistent input stream (rate={self.RATE}, channels={self.CHANNELS}, chunk={self.CHUNK})")
+            t_open = time.time()
+            self.stream = self.audio.open(
+                format=self.FORMAT,
+                channels=self.CHANNELS,
+                rate=self.RATE,
+                input=True,
+                frames_per_buffer=self.CHUNK,
+            )
+            dbg(f"persistent input stream opened in {(time.time() - t_open) * 1000:.0f}ms")
+        except Exception as e:
+            print(f"❌ Failed to open mic stream: {type(e).__name__}: {e}", flush=True)
+            print("   Check System Preferences → Privacy & Security → Microphone", flush=True)
+            sys.exit(1)
+
+        self._capture_running = True
+        self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._capture_thread.start()
+
+        # MLX streams are per-thread, so spin up a dedicated worker that owns
+        # the model from load through inference. Block here until it signals
+        # ready so the user only sees the "Ready" banner once we can transcribe.
+        print("", flush=True)
+        self._worker_thread = threading.Thread(
+            target=self._transcription_worker, daemon=True
+        )
+        self._worker_thread.start()
+        self._model_ready.wait()
+
+        print("═" * 60, flush=True)
+        print("✅ Ready! Press and hold the dictation key to start...", flush=True)
+        print(f"   Hotkey: {self._describe_key(self.record_key)}", flush=True)
+        print("═" * 60 + "\n", flush=True)
 
         # Start keyboard listener
+        listener = None
         try:
-            with keyboard.Listener(
+            dbg("starting keyboard listener")
+            listener = keyboard.Listener(
                 on_press=self.on_press,
-                on_release=self.on_release
-            ) as listener:
-                listener.join()
+                on_release=self.on_release,
+            )
+            listener.start()
+
+            # pynput's Quartz event tap on macOS swallows SIGINT before it
+            # reaches the Python main thread, so install our own handler that
+            # stops the listener and lets join() return.
+            def _sigint(signum, frame):
+                print("\n\n👋 Ctrl+C received, shutting down...\n", flush=True)
+                self.is_recording = False
+                self._capture_running = False
+                self.restore_system_volume()
+                if listener is not None:
+                    listener.stop()
+
+            signal.signal(signal.SIGINT, _sigint)
+            signal.signal(signal.SIGTERM, _sigint)
+
+            dbg("keyboard listener running (join)")
+            listener.join()
+        except KeyboardInterrupt:
+            # Belt-and-suspenders: if the signal does sneak through, still tidy up.
+            print("\n\n👋 Exiting...\n", flush=True)
+            self.is_recording = False
+            self._capture_running = False
+            self.restore_system_volume()
+            if listener is not None:
+                listener.stop()
         except Exception as e:
-            print(f"\n❌ Keyboard listener error: {e}")
-            print("   You may need to grant Accessibility permissions")
-            print("   Go to: System Preferences → Privacy & Security → Accessibility")
+            print(f"\n❌ Keyboard listener error: {type(e).__name__}: {e}", flush=True)
+            print("   You may need to grant Accessibility permissions", flush=True)
+            print("   Go to: System Preferences → Privacy & Security → Accessibility", flush=True)
+            if VERBOSE:
+                import traceback
+                traceback.print_exc()
 
         # Cleanup
+        self._capture_running = False
+        self.restore_system_volume()
+        try:
+            if self.stream is not None:
+                self.stream.stop_stream()
+                self.stream.close()
+                self.stream = None
+        except Exception as e:
+            dbg(f"error closing stream on shutdown: {e}")
         if self.audio:
             self.audio.terminate()
 
@@ -601,8 +859,17 @@ if __name__ == "__main__":
         default='config.yaml',
         help='Path to configuration file (default: config.yaml)'
     )
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Enable verbose debug logging (also set via VERBOSE=1 env var)'
+    )
 
     args = parser.parse_args()
+
+    if args.verbose:
+        globals()['VERBOSE'] = True
+        print("🐛 Verbose logging enabled", flush=True)
 
     try:
         transcriber = VoiceTranscriber(

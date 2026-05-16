@@ -43,17 +43,16 @@ pyinstaller --clean \
     --onefile \
     --name "VoiceTranscriber" \
     --add-data "config.yaml:." \
-    --hidden-import=nemo \
-    --hidden-import=nemo.collections.asr \
+    --hidden-import=parakeet_mlx \
+    --hidden-import=mlx \
     --hidden-import=pyaudio \
     --hidden-import=pynput \
     --hidden-import=pyperclip \
     --hidden-import=yaml \
     --hidden-import=numpy \
     --hidden-import=soundfile \
-    --collect-all nemo \
-    --collect-all nemo_text_processing \
-    --collect-all torch \
+    --collect-all parakeet_mlx \
+    --collect-all mlx \
     transcribe.py
 
 echo
@@ -80,8 +79,8 @@ echo "   3. Run it!"
 echo
 
 echo -e "${YELLOW}⚠️  Note:${NC}"
-echo "   The binary is ~2GB due to including NeMo and PyTorch"
-echo "   First run will still download the Parakeet model (~600MB-2GB)"
+echo "   The binary bundles parakeet-mlx + MLX runtime (Apple Silicon only)"
+echo "   First run will still download the Parakeet model (~600MB)"
 echo
 
 echo -e "${GREEN}Done! 🎉${NC}"

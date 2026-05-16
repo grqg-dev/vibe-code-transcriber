@@ -1,12 +1,11 @@
 # Voice Transcriber Configuration
 
-# NVIDIA Parakeet ASR model to use (Hugging Face / NGC model name)
+# Parakeet ASR model to use (Apple Silicon / MLX flavor on Hugging Face)
 # Popular options:
-#   nvidia/parakeet-tdt-0.6b-v2     - Recommended, fast and accurate (English)
-#   nvidia/parakeet-tdt_ctc-110m    - Smallest, fastest
-#   nvidia/parakeet-rnnt-1.1b       - Largest RNN-T, highest accuracy
-#   nvidia/parakeet-ctc-1.1b        - Largest CTC variant
-parakeet_model: "nvidia/parakeet-tdt-0.6b-v2"
+#   mlx-community/parakeet-tdt-0.6b-v3   - Recommended, fast and accurate
+#   mlx-community/parakeet-tdt-0.6b-v2   - Older v2 weights
+#   mlx-community/parakeet-rnnt-1.1b     - Larger RNN-T, higher accuracy
+parakeet_model: "mlx-community/parakeet-tdt-0.6b-v3"
 
 # Auto-paste transcription after copying to clipboard
 auto_paste: true
@@ -19,10 +18,15 @@ attenuate_volume: true
 # Percentage to reduce volume to during recording (default: 10%)
 attenuation_percent: 10
 
-# Hotkey configuration (advanced users only)
-# Default: 176 (macOS dictation key)
-# Run detect_key.py to find custom key codes
-hotkey_code: 176
+# Hotkey configuration. Can be either:
+#   - a pynput Key name as a string, e.g. 'alt_r', 'shift', 'ctrl', 'f13'
+#   - a numeric VK code, e.g. 176 (macOS Fn-dictation key, if remapped)
+# Run detect_key.py to find your key.
+# On macOS Sequoia/Tahoe, the right-option dictation key reports as 'alt_r'.
+hotkey_code: 'alt_r'
+
+# Save a copy of each recorded WAV under ./debug_audio for troubleshooting
+save_debug_audio: true
 
 # Audio recording settings
 # Note: Parakeet expects 16kHz mono audio
