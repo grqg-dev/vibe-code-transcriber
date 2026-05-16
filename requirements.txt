@@ -1,6 +1,9 @@
-openai-whisper
+nemo_toolkit[asr]
+torch
 pyaudio
 pyperclip
 pynput
 pyyaml
+numpy
+soundfile
 pyinstaller

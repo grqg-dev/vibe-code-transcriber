@@ -43,13 +43,16 @@ pyinstaller --clean \
     --onefile \
     --name "VoiceTranscriber" \
     --add-data "config.yaml:." \
-    --hidden-import=whisper \
+    --hidden-import=nemo \
+    --hidden-import=nemo.collections.asr \
     --hidden-import=pyaudio \
     --hidden-import=pynput \
     --hidden-import=pyperclip \
     --hidden-import=yaml \
     --hidden-import=numpy \
-    --collect-all whisper \
+    --hidden-import=soundfile \
+    --collect-all nemo \
+    --collect-all nemo_text_processing \
     --collect-all torch \
     transcribe.py
 
@@ -77,8 +80,8 @@ echo "   3. Run it!"
 echo
 
 echo -e "${YELLOW}⚠️  Note:${NC}"
-echo "   The binary is ~500MB due to including Whisper and PyTorch"
-echo "   First run will still download the Whisper model"
+echo "   The binary is ~2GB due to including NeMo and PyTorch"
+echo "   First run will still download the Parakeet model (~600MB-2GB)"
 echo
 
 echo -e "${GREEN}Done! 🎉${NC}"

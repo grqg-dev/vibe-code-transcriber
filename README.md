@@ -1,11 +1,11 @@
 # 🎤 Voice Transcriber
 
-A powerful push-to-talk terminal utility that uses OpenAI's Whisper to transcribe speech to text on macOS. Features local processing, auto-paste, audio feedback, and full customization.
+A powerful push-to-talk terminal utility that uses NVIDIA's Parakeet ASR models (via NeMo) to transcribe speech to text on macOS. Features local processing, auto-paste, audio feedback, and full customization.
 
 ## ✨ Features
 
 - **🎯 Push-to-talk recording**: Hold dictation key to record, release to transcribe
-- **🔒 100% Local**: Runs entirely on your machine with Whisper (no API costs, no data sent to cloud)
+- **🔒 100% Local**: Runs entirely on your machine with NVIDIA Parakeet (no API costs, no data sent to cloud)
 - **📋 Auto-clipboard & Auto-paste**: Transcriptions automatically copied and pasted where your cursor is
 - **🔊 Audio feedback**: Beeps when starting/stopping recording
 - **⚙️ Fully customizable**: YAML config for models, hotkeys, and features
@@ -47,8 +47,8 @@ transcribe
 Edit `config.yaml` to customize:
 
 ```yaml
-# Whisper model (tiny.en, base.en, small.en, medium.en, large)
-whisper_model: "base.en"
+# Parakeet model (any nvidia/parakeet-* model on Hugging Face / NGC)
+parakeet_model: "nvidia/parakeet-tdt-0.6b-v2"
 
 # Auto-paste after transcription
 auto_paste: true
@@ -59,22 +59,23 @@ audio_feedback: true
 # Custom hotkey (run detect_key.py to find key codes)
 hotkey_code: 176
 
-# Audio settings
+# Audio settings (Parakeet expects 16kHz mono)
 audio:
   sample_rate: 16000
   channels: 1
   chunk_size: 1024
 ```
 
-### Whisper Models
+### Parakeet Models
 
 | Model | Size | Speed | Best For |
 |-------|------|-------|----------|
-| `tiny.en` | ~39MB | Fastest | Quick notes |
-| `base.en` | ~74MB | Fast | **Default - balanced** |
-| `small.en` | ~244MB | Medium | Better accuracy |
-| `medium.en` | ~769MB | Slow | Professional use |
-| `large` | ~1.5GB | Slowest | Maximum accuracy |
+| `nvidia/parakeet-tdt_ctc-110m` | ~110M | Fastest | Quick notes |
+| `nvidia/parakeet-tdt-0.6b-v2` | ~600M | Fast | **Default - best balance** |
+| `nvidia/parakeet-ctc-1.1b` | ~1.1B | Slower | Higher accuracy |
+| `nvidia/parakeet-rnnt-1.1b` | ~1.1B | Slowest | Maximum accuracy |
+
+All Parakeet models are English-only. The first run will download the model from Hugging Face (cached under `~/.cache/huggingface/`).
 
 ## 🛠️ Advanced
 
@@ -118,7 +119,7 @@ macOS will prompt for:
 1. Press and hold dictation key
 2. Speak into your microphone (you'll hear a beep)
 3. Release key when done (another beep)
-4. Whisper transcribes locally
+4. Parakeet transcribes locally
 5. Text appears in terminal, copies to clipboard, and auto-pastes
 6. Continue working!
 
@@ -139,9 +140,10 @@ macOS will prompt for:
 - Make sure you're using the virtual environment: `source venv/bin/activate`
 - Or run via `./run.sh` which handles this automatically
 
-**Whisper model download fails?**
+**Parakeet model download fails?**
 - Check internet connection
-- Try a smaller model in config.yaml
+- Try a smaller model (e.g. `nvidia/parakeet-tdt_ctc-110m`) in config.yaml
+- Hugging Face Hub access may be required — run `huggingface-cli login` if you hit auth errors
 
 ## 📦 Requirements
 
@@ -179,7 +181,8 @@ MIT License - Feel free to use, modify, and distribute!
 ## 🙏 Credits
 
 Built with:
-- [OpenAI Whisper](https://github.com/openai/whisper) - Speech recognition
+- [NVIDIA NeMo](https://github.com/NVIDIA/NeMo) - Speech recognition toolkit
+- [NVIDIA Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) - ASR models
 - [PyAudio](https://people.csail.mit.edu/hubert/pyaudio/) - Audio recording
 - [pynput](https://github.com/moses-palmer/pynput) - Keyboard control
 - [PyInstaller](https://www.pyinstaller.org/) - Binary packaging

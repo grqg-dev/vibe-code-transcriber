@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 Voice Transcriber - Push-to-talk terminal transcription tool
-Hold dictation key to record, release to transcribe with Whisper
+Hold dictation key to record, release to transcribe with NVIDIA Parakeet
 """
 
 import pyaudio
 import wave
-import whisper
 import pyperclip
 import tempfile
 import os
@@ -23,6 +22,11 @@ import numpy as np
 import argparse
 import subprocess
 import platform
+import logging
+
+# Silence NeMo's verbose logging so it doesn't clobber the terminal UI
+logging.getLogger("nemo_logger").setLevel(logging.ERROR)
+os.environ.setdefault("NEMO_LOGGING_LEVEL", "ERROR")
 
 
 class VoiceTranscriber:
@@ -56,9 +60,9 @@ class VoiceTranscriber:
         self.CHANNELS = self.config['audio']['channels']
         self.RATE = self.config['audio']['sample_rate']
 
-        # Whisper model (will be loaded on first use)
+        # Parakeet ASR model (will be loaded on first use)
         self.model = None
-        self.model_name = self.config['whisper_model']
+        self.model_name = self.config['parakeet_model']
 
         # Thread for recording
         self.record_thread = None
@@ -96,7 +100,7 @@ class VoiceTranscriber:
     def get_default_config(self):
         """Return default configuration"""
         return {
-            'whisper_model': 'base.en',
+            'parakeet_model': 'nvidia/parakeet-tdt-0.6b-v2',
             'auto_paste': True,
             'audio_feedback': True,
             'hotkey_code': 176,
@@ -202,18 +206,38 @@ class VoiceTranscriber:
         except Exception as e:
             return False
 
-    def load_whisper_model(self):
-        """Load Whisper model (this will download on first run)"""
-        if self.model is None:
-            print(f"⏳ Loading Whisper model '{self.model_name}'...")
-            print("   (This may take a moment on first run)")
-            try:
-                self.model = whisper.load_model(self.model_name)
-                print("✅ Model loaded successfully!\n")
-            except Exception as e:
-                print(f"❌ Error loading Whisper model: {e}")
-                print("   Check your internet connection and try again.")
-                sys.exit(1)
+    def load_model(self):
+        """Load NVIDIA Parakeet ASR model (this will download on first run)"""
+        if self.model is not None:
+            return
+
+        print(f"⏳ Loading NVIDIA Parakeet model '{self.model_name}'...")
+        print("   (This may take a moment on first run — model is ~600MB-2GB)")
+        try:
+            import nemo.collections.asr as nemo_asr
+            self.model = nemo_asr.models.ASRModel.from_pretrained(
+                model_name=self.model_name
+            )
+            self.model.eval()
+            print("✅ Model loaded successfully!\n")
+        except Exception as e:
+            print(f"❌ Error loading Parakeet model: {e}")
+            print("   Check your internet connection and that nemo_toolkit is installed.")
+            sys.exit(1)
+
+    def _transcribe_file(self, wav_path):
+        """Run Parakeet inference on a WAV file and return the text."""
+        output = self.model.transcribe([wav_path])
+        # NeMo returns either a list of strings or a list of Hypothesis objects
+        # depending on version / model type. Handle both shapes.
+        if not output:
+            return ""
+        first = output[0]
+        if isinstance(first, list):  # some models return [[hyp], ...]
+            first = first[0] if first else ""
+        if hasattr(first, 'text'):
+            return first.text.strip()
+        return str(first).strip()
 
     def start_recording(self):
         """Start recording audio from microphone"""
@@ -283,7 +307,7 @@ class VoiceTranscriber:
     def _real_time_transcribe(self):
         """Real-time transcription thread - processes audio as it comes in"""
         # Load model if not already loaded
-        self.load_whisper_model()
+        self.load_model()
 
         phrase_bytes = bytes()
         record_timeout = 1.5  # How often to transcribe (in seconds)
@@ -316,13 +340,25 @@ class VoiceTranscriber:
                     audio_duration = len(phrase_bytes) / (2 * self.CHANNELS * self.RATE)  # 2 bytes per sample
 
                     if audio_duration >= min_audio_length and time_since_phrase_start >= record_timeout:
-                        # Convert bytes to numpy array
-                        audio_np = np.frombuffer(phrase_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-
-                        # Transcribe
+                        # Parakeet (via NeMo) transcribes from WAV files, so dump
+                        # the accumulated phrase to a temporary file each pass.
                         try:
-                            result = self.model.transcribe(audio_np, fp16=False)
-                            new_text = result['text'].strip()
+                            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                                tmp_path = tmp.name
+                                wf = wave.open(tmp_path, 'wb')
+                                wf.setnchannels(self.CHANNELS)
+                                wf.setsampwidth(2)  # paInt16 = 2 bytes
+                                wf.setframerate(self.RATE)
+                                wf.writeframes(phrase_bytes)
+                                wf.close()
+
+                            try:
+                                new_text = self._transcribe_file(tmp_path)
+                            finally:
+                                try:
+                                    os.remove(tmp_path)
+                                except OSError:
+                                    pass
 
                             # Type only the new characters
                             if new_text and new_text != self.last_transcribed_text:
@@ -416,7 +452,7 @@ class VoiceTranscriber:
                 print("❌ No audio recorded\n")
 
     def transcribe_audio(self):
-        """Transcribe the recorded audio using Whisper"""
+        """Transcribe the recorded audio using NVIDIA Parakeet"""
         # Create temporary file
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
             temp_filename = temp_file.name
@@ -431,13 +467,12 @@ class VoiceTranscriber:
 
             try:
                 # Load model if not already loaded
-                self.load_whisper_model()
+                self.load_model()
 
                 # Transcribe
                 start_time = time.time()
-                result = self.model.transcribe(temp_filename, fp16=False)
+                text = self._transcribe_file(temp_filename)
                 transcribe_time = time.time() - start_time
-                text = result["text"].strip()
 
                 if text:
                     # Print the transcription with nice formatting

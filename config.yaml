@@ -1,9 +1,12 @@
 # Voice Transcriber Configuration
 
-# Whisper model to use
-# Options: tiny.en, base.en, small.en, medium.en, large
-# Smaller = faster, larger = more accurate
-whisper_model: "base.en"
+# NVIDIA Parakeet ASR model to use (Hugging Face / NGC model name)
+# Popular options:
+#   nvidia/parakeet-tdt-0.6b-v2     - Recommended, fast and accurate (English)
+#   nvidia/parakeet-tdt_ctc-110m    - Smallest, fastest
+#   nvidia/parakeet-rnnt-1.1b       - Largest RNN-T, highest accuracy
+#   nvidia/parakeet-ctc-1.1b        - Largest CTC variant
+parakeet_model: "nvidia/parakeet-tdt-0.6b-v2"
 
 # Auto-paste transcription after copying to clipboard
 auto_paste: true
@@ -22,6 +25,7 @@ attenuation_percent: 10
 hotkey_code: 176
 
 # Audio recording settings
+# Note: Parakeet expects 16kHz mono audio
 audio:
   sample_rate: 16000
   channels: 1
