@@ -55,7 +55,8 @@ def dbg(msg):
 
 
 class VoiceTranscriber:
-    def __init__(self, config_path="config.yaml", real_time_mode=False):
+    def __init__(self, config_path="config.yaml", real_time_mode=False,
+                 indicator_style_override=None):
         # Load configuration
         self.config = self.load_config(config_path)
 
@@ -156,11 +157,14 @@ class VoiceTranscriber:
         # Failure to spawn the indicator MUST be soft — the recorder
         # works fine without it.
         self.show_indicator = self.config.get('show_indicator', True)
-        self.indicator_style = self.config.get('indicator_style', 'eq')
+        # CLI --style overrides config; both fall back to 'eq'.
+        self.indicator_style = indicator_style_override or self.config.get('indicator_style', 'eq')
         if self.indicator_style not in ('eq', 'spectrogram', 'orb'):
             print(f"⚠️  Unknown indicator_style {self.indicator_style!r}, "
                   f"falling back to 'eq'", flush=True)
             self.indicator_style = 'eq'
+        if indicator_style_override:
+            dbg(f"indicator_style overridden via CLI: {self.indicator_style}")
         # Per-style payload sizes. MUST match the corresponding constants
         # in indicator.py (EQ_BAND_COUNT, SG_ROWS, ORB_WAVEFORM_LENGTH).
         self._spectrum_band_count = {
@@ -1230,6 +1234,13 @@ if __name__ == "__main__":
         action='store_true',
         help='Enable verbose debug logging (also set via VERBOSE=1 env var)'
     )
+    parser.add_argument(
+        '--style', '--indicator-style',
+        choices=['eq', 'spectrogram', 'orb'],
+        default=None,
+        help='Override indicator_style from config.yaml for this run only '
+             '(eq, spectrogram, or orb)',
+    )
 
     args = parser.parse_args()
 
@@ -1240,7 +1251,8 @@ if __name__ == "__main__":
     try:
         transcriber = VoiceTranscriber(
             config_path=args.config,
-            real_time_mode=args.real_time
+            real_time_mode=args.real_time,
+            indicator_style_override=args.style,
         )
         transcriber.run()
     except KeyboardInterrupt:
