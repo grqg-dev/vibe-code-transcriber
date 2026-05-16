@@ -16,11 +16,13 @@ fast cold start, no CUDA, no torch).
 - **🔒 Fully local** — Model runs on your Mac's GPU/Neural Engine. No cloud.
 - **📋 Clipboard + auto-paste** — Result is copied and pasted at the cursor.
 - **🔊 Audio cue** — Start/stop beeps. Volume-attenuation knob for noisy meetings.
-- **📊 Floating spectrogram waterfall** — A small live spectrogram (32
-  frequency bins × ~5 sec of history, magma-colormapped) pops up next to
-  the text insertion caret (or the mouse cursor, if no caret is exposed)
-  while you hold the hotkey. See your voice's harmonics scroll past in
-  real time and confirm at a glance that the mic is hot.
+- **📊 Floating visualization** — A small audio visualization pops up next
+  to the text insertion caret (or the mouse cursor, if no caret is exposed)
+  while you hold the hotkey. Three styles, selectable via `indicator_style`
+  in `config.yaml`:
+  - `eq` (default) — 16-band segmented VU bars with peak-hold.
+  - `spectrogram` — Scrolling magma-colormapped waterfall (32 freq × ~5 sec).
+  - `orb` — Pulsing core with a circular oscilloscope outline.
 - **⚡ Zero key-press latency** — Mic is held open at startup; the beep is a
   truthful "now recording" cue, not a "starting to start" cue.
 - **🔍 Debug audio dump** — Every recording is saved under `debug_audio/`
@@ -70,7 +72,8 @@ the hotkey usually needs tweaking.
 | `attenuate_volume` | `true` | Lower system **output** volume while recording (so background music/Zoom audio doesn't bleed into the mic). |
 | `attenuation_percent` | `10` | Target % of original volume during recording. |
 | `save_debug_audio` | `true` | Save every recording WAV under `./debug_audio/`. |
-| `show_indicator` | `true` | Spawn the floating spectrogram sidecar (`indicator.py`) while recording. Disable if you find it distracting or if it ever misbehaves. |
+| `show_indicator` | `true` | Spawn the floating visualization sidecar (`indicator.py`) while recording. Disable if you find it distracting or if it ever misbehaves. |
+| `indicator_style` | `'eq'` | Visualization style. One of `'eq'` (16-band VU bars), `'spectrogram'` (scrolling waterfall), `'orb'` (pulsing core + circular oscilloscope). |
 | `audio.sample_rate` | `16000` | Parakeet expects 16 kHz mono. Don't change unless you know why. |
 | `audio.channels` | `1` | Mono. |
 | `audio.chunk_size` | `1024` | Frames per PortAudio chunk. 1024 / 16000 ≈ 64 ms per chunk. |
@@ -211,15 +214,16 @@ remapped under System Settings → Keyboard → Dictation.
    if you click somewhere else mid-recording the paste will land at the
    new cursor — that's existing macOS behavior and intentional.
 
-9. **Spectrum is computed in the parent, rendered in the child.**
-   The capture thread already has the raw int16 chunks; it runs an FFT
-   (Hann-windowed, ~70 µs per 1024-sample chunk), bins into 32
-   log-spaced bands from 80 Hz to 7.5 kHz, converts to dB, and ships the
-   32 floats to the child as `{"type":"spectrum","bands":[...]}`. The
-   child treats each message as a new rightmost column of the waterfall
-   — no DSP, just deque maintenance + a 256-entry magma-colormap LUT
-   lookup per cell + `NSBezierPath` rect fills. This split keeps PyObjC
-   out of the audio path and numpy out of the AppKit process.
+9. **DSP runs in the parent, drawing runs in the child.**
+   The capture thread already has the raw int16 chunks. Depending on
+   the active style, it either runs an FFT (Hann-windowed, ~70 µs per
+   1024-sample chunk, log-spaced into 16 or 32 bands, dB-clamped) and
+   ships `{"type":"spectrum","bands":[...]}`, or downsamples to a 128-point
+   normalized waveform and ships `{"type":"waveform","samples":[...]}`.
+   The child does no DSP — just deque/state maintenance + drawing. This
+   split keeps PyObjC out of the audio path and numpy out of the AppKit
+   process, and means switching visualization styles is a config flip,
+   not a code change.
 
 ---
 

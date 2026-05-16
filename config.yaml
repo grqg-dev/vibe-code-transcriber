@@ -28,10 +28,21 @@ hotkey_code: 'alt_r'
 # Save a copy of each recorded WAV under ./debug_audio for troubleshooting
 save_debug_audio: true
 
-# Floating VU meter at the cursor while recording.
+# Floating visualization next to the text caret while recording.
 # Spawned as a sidecar subprocess (indicator.py). Non-activating, so it
 # never steals focus and doesn't break auto-paste. Set to false to disable.
 show_indicator: true
+
+# Visualization style for the floating indicator. Options:
+#   eq          - 16-band segmented VU/EQ bars with peak hold. Compact
+#                 (200x40), classic, responsive. Default.
+#   spectrogram - Scrolling waterfall (32 freq bins x ~5 sec time history)
+#                 with the magma colormap. Larger panel (240x72).
+#                 Shows speech harmonics & sibilants nicely.
+#   orb         - Square 100x100 panel with a pulsing inner core surrounded
+#                 by a circular oscilloscope outline that wiggles with the
+#                 live waveform. macOS-y, distinctive.
+indicator_style: eq
 
 # Audio recording settings
 # Note: Parakeet expects 16kHz mono audio

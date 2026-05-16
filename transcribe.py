@@ -150,9 +150,23 @@ class VoiceTranscriber:
         self._capture_thread = None
         self._capture_running = False
 
-        # Optional floating VU meter (sidecar process; see indicator.py).
-        # Failure here MUST be soft — the recorder works fine without it.
+        # Optional floating visualization (sidecar process; see indicator.py).
+        # Three styles supported; payload shape varies per style and is
+        # locked to the indicator's STYLES table — keep these in sync.
+        # Failure to spawn the indicator MUST be soft — the recorder
+        # works fine without it.
         self.show_indicator = self.config.get('show_indicator', True)
+        self.indicator_style = self.config.get('indicator_style', 'eq')
+        if self.indicator_style not in ('eq', 'spectrogram', 'orb'):
+            print(f"⚠️  Unknown indicator_style {self.indicator_style!r}, "
+                  f"falling back to 'eq'", flush=True)
+            self.indicator_style = 'eq'
+        # Per-style payload sizes. MUST match the corresponding constants
+        # in indicator.py (EQ_BAND_COUNT, SG_ROWS, ORB_WAVEFORM_LENGTH).
+        self._spectrum_band_count = {
+            'eq': 16, 'spectrogram': 32, 'orb': 0,
+        }[self.indicator_style]
+        self._waveform_length = 128 if self.indicator_style == 'orb' else 0
         self._indicator = None
 
     def load_config(self, config_path):
@@ -178,6 +192,7 @@ class VoiceTranscriber:
             'hotkey_code': 'alt_r',
             'save_debug_audio': True,
             'show_indicator': True,
+            'indicator_style': 'eq',
             'audio': {
                 'sample_rate': 16000,
                 'channels': 1,
@@ -441,20 +456,26 @@ class VoiceTranscriber:
             if not self.is_recording:
                 continue
 
-            # Drive the floating spectrum indicator. FFT + log-spaced
-            # binning into 16 bands. Cost is ~50 µs per chunk on M-series;
-            # cheap enough to run unconditionally inside the gate at
-            # ~15 fps without measurable impact on capture latency.
+            # Drive the floating indicator. Branch by style: bar/waterfall
+            # styles want a frequency spectrum, orb wants a time-domain
+            # waveform. Both pipelines run in tens of microseconds per
+            # chunk on M-series — no measurable impact on capture latency.
             if self._indicator is not None:
                 try:
                     samples = np.frombuffer(data, dtype=np.int16)
                     if samples.size:
-                        bands = self._compute_spectrum_bands(samples)
-                        self._send_to_indicator(
-                            {"type": "spectrum", "bands": bands}
-                        )
+                        if self.indicator_style == 'orb':
+                            wave = self._compute_waveform_samples(samples)
+                            self._send_to_indicator(
+                                {"type": "waveform", "samples": wave}
+                            )
+                        else:
+                            bands = self._compute_spectrum_bands(samples)
+                            self._send_to_indicator(
+                                {"type": "spectrum", "bands": bands}
+                            )
                 except Exception as e:
-                    dbg(f"spectrum send failed: {type(e).__name__}: {e}")
+                    dbg(f"indicator send failed: {type(e).__name__}: {e}")
 
             if self.real_time_mode:
                 self.data_queue.put(data)
@@ -740,14 +761,16 @@ class VoiceTranscriber:
             return
         try:
             self._indicator = subprocess.Popen(
-                [sys.executable, str(Path(__file__).parent / 'indicator.py')],
+                [sys.executable,
+                 str(Path(__file__).parent / 'indicator.py'),
+                 '--style', self.indicator_style],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 text=True,
                 bufsize=1,  # line-buffered so each JSON line flushes immediately
             )
-            dbg(f"indicator subprocess started (pid={self._indicator.pid})")
+            dbg(f"indicator subprocess started (pid={self._indicator.pid}, style={self.indicator_style})")
         except Exception as e:
             print(f"⚠️  Indicator failed to start (non-fatal): "
                   f"{type(e).__name__}: {e}", flush=True)
@@ -917,14 +940,11 @@ class VoiceTranscriber:
                 pass
         self._indicator = None
 
-    # Must match ROWS in indicator.py — the IPC contract requires exactly
-    # this many band values per "spectrum" message. 32 gives the
-    # spectrogram waterfall enough vertical resolution to actually show
-    # speech harmonics & sibilants while still fitting in a small panel.
-    _SPECTRUM_BAND_COUNT = 32
-
     def _compute_spectrum_bands(self, samples_int16):
-        """16 log-spaced frequency band magnitudes (0..1) for one audio chunk.
+        """Log-spaced frequency band magnitudes (0..1) for one audio chunk.
+
+        Output length = self._spectrum_band_count, which the active
+        indicator style dictates (16 for 'eq', 32 for 'spectrogram').
 
         Pipeline:
           1. int16 → float32 in [-1, 1]
@@ -933,11 +953,11 @@ class VoiceTranscriber:
           3. rFFT → magnitude → power spectrum
           4. Mean power per log-spaced band edge (80 Hz .. 7.5 kHz)
           5. 10·log10 → dB
-          6. Clamp [-70, -10] dB and linearly map to [0, 1]
+          6. Clamp [-30, +5] dB and linearly map to [0, 1]
 
         Band edges and the window are cached on first call (they depend
         only on chunk size, which is fixed). Subsequent calls are pure
-        numpy math — ~50 µs on M-series for chunk_size=1024.
+        numpy math — ~70 µs on M-series for chunk_size=1024.
         """
         n = samples_int16.shape[0]
         if getattr(self, '_fft_n', None) != n:
@@ -951,7 +971,7 @@ class VoiceTranscriber:
         # Mean power per band (vectorized via np.add.reduceat would be
         # marginally faster, but the BAND_COUNT-element Python loop here
         # is already negligible at 15 Hz).
-        bands = np.empty(self._SPECTRUM_BAND_COUNT, dtype=np.float32)
+        bands = np.empty(self._spectrum_band_count, dtype=np.float32)
         for i, (lo, hi) in enumerate(self._band_bins):
             bands[i] = power[lo:hi].mean() if hi > lo else power[lo]
 
@@ -963,6 +983,43 @@ class VoiceTranscriber:
         # only on shouts.
         db = 10.0 * np.log10(bands)
         normalized = np.clip((db + 30.0) / 35.0, 0.0, 1.0)
+        return normalized.tolist()
+
+    # Empirical gain factor for the orb's waveform output. Built-in Mac
+    # mics rarely send int16 peaks past ~8000 during normal speech, so
+    # multiplying by 4/32768 maps "normal speech amplitude" to roughly
+    # ±0.6 on the [-1, 1] scale the orb's deflection expects. Loud speech
+    # saturates near ±1.0; whispers stay readable but subtle.
+    _WAVEFORM_GAIN = 4.0
+
+    def _compute_waveform_samples(self, samples_int16):
+        """Downsample a chunk to self._waveform_length floats in [-1, 1].
+
+        The orb draws each value as one point around a circle, so we don't
+        need anti-aliased downsampling — simple decimation (every Nth
+        sample) is visually identical at this resolution and avoids any
+        FFT or filter pass.
+
+        Output is plain Python list (JSON-serializable). At gain 4.0 with
+        a typical built-in mic, normal speech produces ±0.4..0.7
+        deflection on the orb; loud speech saturates near ±1.0.
+        """
+        n = samples_int16.shape[0]
+        target = self._waveform_length
+        if target <= 0 or n == 0:
+            return [0.0] * max(target, 0)
+        factor = max(1, n // target)
+        decimated = samples_int16[::factor][:target]
+        # Pad if for some reason we didn't get enough (shouldn't happen
+        # with chunk_size=1024 and target=128).
+        if decimated.shape[0] < target:
+            decimated = np.pad(
+                decimated, (0, target - decimated.shape[0])
+            )
+        normalized = np.clip(
+            decimated.astype(np.float32) * (self._WAVEFORM_GAIN / 32768.0),
+            -1.0, 1.0,
+        )
         return normalized.tolist()
 
     def _init_spectrum_cache(self, n_samples):
@@ -978,7 +1035,7 @@ class VoiceTranscriber:
         f_min, f_max = 80.0, min(self.RATE * 0.47, 7500.0)
         edges = np.logspace(
             np.log10(f_min), np.log10(f_max),
-            self._SPECTRUM_BAND_COUNT + 1,
+            self._spectrum_band_count + 1,
         )
         bins = []
         for lo_f, hi_f in zip(edges[:-1], edges[1:]):

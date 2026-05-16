@@ -41,25 +41,29 @@ Each one was a real bug in a prior iteration.
  must not be able to press the hotkey before the worker has loaded +
  warmed up the model.
 
-7. **The spectrogram indicator is a sidecar process, never in-process.**
- `indicator.py` is spawned by `transcribe.py` and talks JSON-lines over
- stdin. Do not try to integrate AppKit into the parent: Cocoa requires
- the main thread for `NSApp.run()`, and the parent's main thread is
- the listener cleanup anchor. The protocol is:
+7. **The visualization indicator is a sidecar process, never in-process.**
+ `indicator.py` is spawned by `transcribe.py` (with `--style eq|spectrogram|orb`)
+ and talks JSON-lines over stdin. Do not try to integrate AppKit into
+ the parent: Cocoa requires the main thread for `NSApp.run()`, and the
+ parent's main thread is the listener cleanup anchor. The protocol:
 
  ```
- {"type":"show",     "x":FLOAT,"y":FLOAT}   # AppKit top-left, computed by parent
- {"type":"spectrum", "bands":[F0..F31]}     # 32 floats in [0,1], log-spaced.
-                                            # Each message = one new rightmost column.
- {"type":"hide"}                            # hide panel + clear history
- {"type":"quit"}                            # tear down NSApp and exit
+ {"type":"show",     "x":FLOAT,"y":FLOAT}     # AppKit top-left, computed by parent
+ {"type":"spectrum", "bands":[F0..F_{n-1}]}   # used by eq (16) + spectrogram (32). [0,1].
+ {"type":"waveform", "samples":[F0..F127]}    # used by orb. [-1, 1].
+ {"type":"hide"}                              # hide panel + reset state
+ {"type":"quit"}                              # tear down NSApp and exit
  ```
 
- The band count is bound on both sides: `ROWS` in `indicator.py` and
- `_SPECTRUM_BAND_COUNT` in `transcribe.py` MUST stay equal. New message
- types should be forward-compatible (unknown types are ignored).
- Indicator failures must always be soft — `_send_to_indicator` nulls
- the handle on `BrokenPipeError` and the rest of the app carries on.
+ Payload sizes are bound on both sides — `EQ_BAND_COUNT` / `SG_ROWS` /
+ `ORB_WAVEFORM_LENGTH` in `indicator.py` MUST match `_spectrum_band_count`
+ and `_waveform_length` derived from `indicator_style` in `transcribe.py`.
+ New message types should be forward-compatible (unknown types are
+ ignored). Indicator failures must always be soft — `_send_to_indicator`
+ nulls the handle on `BrokenPipeError` and the rest of the app carries
+ on. Adding a new style means: a new constants block + view class +
+ STYLES entry in `indicator.py`, plus updating `__init__`'s style
+ validator and the `_capture_loop` branch in `transcribe.py`.
 
 8. **Indicator anchor: try caret first, fall back to mouse.** The parent
  computes the AppKit-coord top-left of the indicator in
@@ -111,7 +115,7 @@ print(repr(r.text))
 | File | Role |
 |---|---|
 | `transcribe.py` | The entire app: `VoiceTranscriber` class. |
-| `indicator.py` | Sidecar process. NSPanel + custom NSView that draws the floating scrolling spectrogram (32 freq bins × 80 time cols, magma colormap). Reads `{"type":..., ...}` JSON lines from stdin. Self-terminates on stdin EOF (parent death). Does no DSP — just deque maintenance + per-cell LUT lookup + rect fills. |
+| `indicator.py` | Sidecar process. NSPanel + one of three custom NSViews (eq / spectrogram / orb), selected by `--style` CLI arg. Reads `{"type":..., ...}` JSON lines from stdin. Self-terminates on stdin EOF (parent death). Does no DSP — only state maintenance + drawing. |
 | `config.yaml` | Runtime config. Loaded once. |
 | `detect_key.py` | Standalone: prints what pynput sees for any keypress. Use when the configured `hotkey_code` doesn't match what the user's key emits. |
 | `install.sh` | brew + venv + `pip install -r requirements.txt`. |
