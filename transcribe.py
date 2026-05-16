@@ -11,6 +11,7 @@ import pyperclip
 import tempfile
 import os
 import sys
+import json
 from pynput import keyboard
 from pynput.keyboard import Key, KeyCode, Controller
 import threading
@@ -149,6 +150,11 @@ class VoiceTranscriber:
         self._capture_thread = None
         self._capture_running = False
 
+        # Optional floating VU meter (sidecar process; see indicator.py).
+        # Failure here MUST be soft — the recorder works fine without it.
+        self.show_indicator = self.config.get('show_indicator', True)
+        self._indicator = None
+
     def load_config(self, config_path):
         """Load configuration from YAML file"""
         try:
@@ -171,6 +177,7 @@ class VoiceTranscriber:
             'audio_feedback': True,
             'hotkey_code': 'alt_r',
             'save_debug_audio': True,
+            'show_indicator': True,
             'audio': {
                 'sample_rate': 16000,
                 'channels': 1,
@@ -378,6 +385,17 @@ class VoiceTranscriber:
             self.transcription_thread.start()
             dbg("real-time transcription thread started")
 
+        # Pop the floating spectrum at the text-caret position (preferred)
+        # or the mouse cursor (fallback) BEFORE the beep so the visual lines
+        # up with the audio cue. _get_indicator_anchor returns AppKit-coord
+        # top-left, exactly what the indicator expects.
+        if self._indicator is not None:
+            anchor = self._get_indicator_anchor()
+            if anchor is not None:
+                self._send_to_indicator(
+                    {"type": "show", "x": float(anchor[0]), "y": float(anchor[1])}
+                )
+
         if self.real_time_mode:
             print("\n" + "─" * 60)
             print("🔴 REAL-TIME RECORDING... (release key to stop)")
@@ -422,6 +440,21 @@ class VoiceTranscriber:
 
             if not self.is_recording:
                 continue
+
+            # Drive the floating spectrum indicator. FFT + log-spaced
+            # binning into 16 bands. Cost is ~50 µs per chunk on M-series;
+            # cheap enough to run unconditionally inside the gate at
+            # ~15 fps without measurable impact on capture latency.
+            if self._indicator is not None:
+                try:
+                    samples = np.frombuffer(data, dtype=np.int16)
+                    if samples.size:
+                        bands = self._compute_spectrum_bands(samples)
+                        self._send_to_indicator(
+                            {"type": "spectrum", "bands": bands}
+                        )
+                except Exception as e:
+                    dbg(f"spectrum send failed: {type(e).__name__}: {e}")
 
             if self.real_time_mode:
                 self.data_queue.put(data)
@@ -543,6 +576,11 @@ class VoiceTranscriber:
 
         self.is_recording = False
         duration = time.time() - self.record_start_time
+
+        # Hide the VU meter immediately on release — the visual should
+        # disappear with the keypress, not after transcription finishes.
+        if self._indicator is not None:
+            self._send_to_indicator({"type": "hide"})
 
         # Restore system volume immediately so the user hears the beep at
         # their normal level.
@@ -689,6 +727,269 @@ class VoiceTranscriber:
 
         print("─" * 60 + "\n", flush=True)
 
+    def _spawn_indicator(self):
+        """Launch indicator.py as a sidecar subprocess.
+
+        We talk to it over its stdin as JSON lines (see indicator.py for the
+        protocol). All failure modes here are non-fatal: if the spawn fails
+        we just null out the handle and the rest of the app skips IPC. The
+        recorder must work fully without the indicator.
+        """
+        if not self.show_indicator:
+            dbg("indicator disabled via config (show_indicator: false)")
+            return
+        try:
+            self._indicator = subprocess.Popen(
+                [sys.executable, str(Path(__file__).parent / 'indicator.py')],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,  # line-buffered so each JSON line flushes immediately
+            )
+            dbg(f"indicator subprocess started (pid={self._indicator.pid})")
+        except Exception as e:
+            print(f"⚠️  Indicator failed to start (non-fatal): "
+                  f"{type(e).__name__}: {e}", flush=True)
+            self._indicator = None
+
+    def _send_to_indicator(self, msg):
+        """Send one JSON message to the indicator. Silent on broken pipe.
+
+        Called from many threads (listener for show/hide, capture loop for
+        level, main for quit). subprocess.Popen.stdin.write isn't documented
+        as thread-safe, but stdlib io.TextIOWrapper holds the GIL for the
+        single write+flush sequence we do here — good enough for our rate.
+        If the indicator died, BrokenPipeError nulls the handle so we stop
+        trying.
+        """
+        proc = self._indicator
+        if proc is None or proc.stdin is None:
+            return
+        try:
+            proc.stdin.write(json.dumps(msg) + "\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as e:
+            dbg(f"indicator pipe broken ({type(e).__name__}: {e}) — disabling")
+            self._indicator = None
+
+    def _get_indicator_anchor(self):
+        """Return the (x, y) AppKit-coord top-left where the indicator
+        should appear, or None if we can't compute one.
+
+        Strategy:
+          1. Ask the Accessibility API for the focused element's text
+             caret rect. Land the indicator just below + slightly right
+             of the caret. This is what the user wants in 95% of cases —
+             the spectrum appears at the spot where their transcription
+             is going to land.
+          2. Fall back to NSEvent.mouseLocation() with a small offset
+             from the I-beam.
+
+        The AX path needs the same Accessibility permission already
+        required for the simulated ⌘V auto-paste, so the permission cost
+        is zero. Apps that don't publish their text caret correctly
+        (Electron apps, some browsers' chrome) silently fall back to the
+        mouse cursor.
+        """
+        caret = self._caret_top_left_appkit()
+        if caret is not None:
+            return caret
+        return self._mouse_top_left_appkit()
+
+    def _caret_top_left_appkit(self):
+        """AX-based caret bounds → AppKit top-left, or None on any failure.
+
+        Synchronous and runs on the listener thread. The AX call typically
+        takes 1-20 ms; not free, but cheap enough to do on key press
+        without the user noticing.
+        """
+        try:
+            from ApplicationServices import (
+                AXUIElementCreateSystemWide,
+                AXUIElementCopyAttributeValue,
+                AXUIElementCopyParameterizedAttributeValue,
+                AXValueGetValue,
+                kAXValueCGRectType,
+                kAXFocusedUIElementAttribute,
+                kAXSelectedTextRangeAttribute,
+                kAXBoundsForRangeParameterizedAttribute,
+            )
+            from AppKit import NSScreen
+        except Exception as e:
+            dbg(f"AX import failed: {type(e).__name__}: {e}")
+            return None
+
+        try:
+            sys_elem = AXUIElementCreateSystemWide()
+            err, focused = AXUIElementCopyAttributeValue(
+                sys_elem, kAXFocusedUIElementAttribute, None
+            )
+            if err != 0 or focused is None:
+                dbg(f"AX focused-element lookup failed (err={err})")
+                return None
+
+            err, sel_range = AXUIElementCopyAttributeValue(
+                focused, kAXSelectedTextRangeAttribute, None
+            )
+            if err != 0 or sel_range is None:
+                dbg(f"AX selected-range lookup failed (err={err})")
+                return None
+
+            err, bounds_val = AXUIElementCopyParameterizedAttributeValue(
+                focused, kAXBoundsForRangeParameterizedAttribute,
+                sel_range, None,
+            )
+            if err != 0 or bounds_val is None:
+                dbg(f"AX bounds-for-range lookup failed (err={err})")
+                return None
+
+            ok, rect = AXValueGetValue(bounds_val, kAXValueCGRectType, None)
+            if not ok or rect is None:
+                dbg("AX value unwrap failed")
+                return None
+
+            # rect is a CGRect in screen coords with origin = TOP-LEFT
+            # (Quartz). Convert to AppKit (origin = BOTTOM-LEFT) using
+            # the height of the screen containing the caret.
+            caret_x = float(rect.origin.x)
+            caret_top_y = float(rect.origin.y)
+            caret_h = float(rect.size.height) or 18.0
+            caret_bottom_y_quartz = caret_top_y + caret_h
+
+            # Quartz→AppKit Y-flip uses the main screen's height — that's
+            # the canonical macOS transform regardless of which physical
+            # display the point lives on. Both coord spaces are anchored
+            # to the main screen's corner; only the axis direction differs.
+            main_h = self._main_screen_height()
+            # AppKit y of where we want the indicator's top edge to sit:
+            # just below the caret's bottom, with a small gap.
+            top_y_appkit = main_h - caret_bottom_y_quartz - 4.0
+            # Nudge a hair to the right so the panel sits next to (not
+            # under) the caret column.
+            top_x_appkit = caret_x + 4.0
+            dbg(f"caret anchor: rect={rect}, top_left_appkit=({top_x_appkit:.0f}, {top_y_appkit:.0f})")
+            return (top_x_appkit, top_y_appkit)
+        except Exception as e:
+            dbg(f"caret lookup failed: {type(e).__name__}: {e}")
+            return None
+
+    def _mouse_top_left_appkit(self):
+        """NSEvent.mouseLocation() with a small below-right offset.
+
+        Used only when the AX caret lookup fails (kAXErrorNoValue, an app
+        that doesn't publish caret info, no focused text field, etc.).
+        """
+        try:
+            from AppKit import NSEvent
+            pt = NSEvent.mouseLocation()
+            # +16 right, -8 below in AppKit coords (= below the I-beam tip).
+            dbg(f"mouse fallback anchor: ({pt.x:.0f}, {pt.y:.0f})")
+            return (float(pt.x) + 16.0, float(pt.y) - 8.0)
+        except Exception as e:
+            dbg(f"mouse fallback lookup failed: {type(e).__name__}: {e}")
+            return None
+
+    def _main_screen_height(self):
+        """Height of the main screen in points, used for Quartz↔AppKit Y flip."""
+        try:
+            from AppKit import NSScreen
+            main = NSScreen.mainScreen()
+            if main is not None:
+                return float(main.frame().size.height)
+        except Exception as e:
+            dbg(f"main-screen lookup failed: {type(e).__name__}: {e}")
+        return 1080.0
+
+    def _shutdown_indicator(self):
+        """Tell the indicator to quit and reap it. Idempotent."""
+        proc = self._indicator
+        if proc is None:
+            return
+        self._send_to_indicator({"type": "quit"})
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            dbg("indicator didn't quit in time — killing")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        self._indicator = None
+
+    # Must match ROWS in indicator.py — the IPC contract requires exactly
+    # this many band values per "spectrum" message. 32 gives the
+    # spectrogram waterfall enough vertical resolution to actually show
+    # speech harmonics & sibilants while still fitting in a small panel.
+    _SPECTRUM_BAND_COUNT = 32
+
+    def _compute_spectrum_bands(self, samples_int16):
+        """16 log-spaced frequency band magnitudes (0..1) for one audio chunk.
+
+        Pipeline:
+          1. int16 → float32 in [-1, 1]
+          2. Hann window (reduces spectral leakage so a single tone doesn't
+             smear across multiple bands)
+          3. rFFT → magnitude → power spectrum
+          4. Mean power per log-spaced band edge (80 Hz .. 7.5 kHz)
+          5. 10·log10 → dB
+          6. Clamp [-70, -10] dB and linearly map to [0, 1]
+
+        Band edges and the window are cached on first call (they depend
+        only on chunk size, which is fixed). Subsequent calls are pure
+        numpy math — ~50 µs on M-series for chunk_size=1024.
+        """
+        n = samples_int16.shape[0]
+        if getattr(self, '_fft_n', None) != n:
+            self._init_spectrum_cache(n)
+
+        # Hann-windowed float spectrum, power = |X|^2.
+        samples = samples_int16.astype(np.float32) * (1.0 / 32768.0)
+        spec = np.fft.rfft(samples * self._fft_window)
+        power = (spec.real * spec.real + spec.imag * spec.imag) + 1e-12
+
+        # Mean power per band (vectorized via np.add.reduceat would be
+        # marginally faster, but the BAND_COUNT-element Python loop here
+        # is already negligible at 15 Hz).
+        bands = np.empty(self._SPECTRUM_BAND_COUNT, dtype=np.float32)
+        for i, (lo, hi) in enumerate(self._band_bins):
+            bands[i] = power[lo:hi].mean() if hi > lo else power[lo]
+
+        # Power → dB, clamped to a perceptually-useful display range.
+        # Empirically calibrated on the built-in MBP mic at 16 kHz / 1024
+        # chunk: deep silence registers ~-40 dB, room tone ~-30 dB, quiet
+        # speech ~-5 dB, loud speech peaks ~+10 dB. Mapping [-30, +5] dB
+        # → [0, 1] keeps silence dark, makes speech vibrant, and saturates
+        # only on shouts.
+        db = 10.0 * np.log10(bands)
+        normalized = np.clip((db + 30.0) / 35.0, 0.0, 1.0)
+        return normalized.tolist()
+
+    def _init_spectrum_cache(self, n_samples):
+        """Pre-compute Hann window + per-band FFT-bin index ranges.
+
+        Called lazily on the first chunk (and only re-runs if chunk size
+        ever changes, which it shouldn't).
+        """
+        freqs = np.fft.rfftfreq(n_samples, 1.0 / self.RATE)
+        # 80 Hz - 7.5 kHz covers speech well; below 80 Hz is mostly
+        # rumble / handling noise on a built-in mic, above 7.5 kHz is
+        # near Nyquist for 16 kHz capture.
+        f_min, f_max = 80.0, min(self.RATE * 0.47, 7500.0)
+        edges = np.logspace(
+            np.log10(f_min), np.log10(f_max),
+            self._SPECTRUM_BAND_COUNT + 1,
+        )
+        bins = []
+        for lo_f, hi_f in zip(edges[:-1], edges[1:]):
+            i_lo = int(np.searchsorted(freqs, lo_f))
+            i_hi = max(i_lo + 1, int(np.searchsorted(freqs, hi_f)))
+            bins.append((i_lo, i_hi))
+        self._band_bins = bins
+        self._fft_window = np.hanning(n_samples).astype(np.float32)
+        self._fft_n = n_samples
+        dbg(f"spectrum cache initialized: n={n_samples}, bins={bins}")
+
     def _describe_key(self, key):
         """Return a human-readable description of a pynput key for debug logging."""
         try:
@@ -783,6 +1084,11 @@ class VoiceTranscriber:
         self._worker_thread.start()
         self._model_ready.wait()
 
+        # Spawn the floating VU meter sidecar AFTER the model is ready so its
+        # startup doesn't bottleneck the "Ready" banner, and BEFORE the
+        # listener starts so the first keypress already has a live pipe.
+        self._spawn_indicator()
+
         print("═" * 60, flush=True)
         print("✅ Ready! Press and hold the dictation key to start...", flush=True)
         print(f"   Hotkey: {self._describe_key(self.record_key)}", flush=True)
@@ -806,6 +1112,7 @@ class VoiceTranscriber:
                 self.is_recording = False
                 self._capture_running = False
                 self.restore_system_volume()
+                self._shutdown_indicator()
                 if listener is not None:
                     listener.stop()
 
@@ -820,6 +1127,7 @@ class VoiceTranscriber:
             self.is_recording = False
             self._capture_running = False
             self.restore_system_volume()
+            self._shutdown_indicator()
             if listener is not None:
                 listener.stop()
         except Exception as e:
@@ -833,6 +1141,7 @@ class VoiceTranscriber:
         # Cleanup
         self._capture_running = False
         self.restore_system_volume()
+        self._shutdown_indicator()
         try:
             if self.stream is not None:
                 self.stream.stop_stream()

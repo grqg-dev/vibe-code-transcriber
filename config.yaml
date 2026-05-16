@@ -28,6 +28,11 @@ hotkey_code: 'alt_r'
 # Save a copy of each recorded WAV under ./debug_audio for troubleshooting
 save_debug_audio: true
 
+# Floating VU meter at the cursor while recording.
+# Spawned as a sidecar subprocess (indicator.py). Non-activating, so it
+# never steals focus and doesn't break auto-paste. Set to false to disable.
+show_indicator: true
+
 # Audio recording settings
 # Note: Parakeet expects 16kHz mono audio
 audio:

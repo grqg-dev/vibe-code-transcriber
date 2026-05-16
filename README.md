@@ -16,6 +16,11 @@ fast cold start, no CUDA, no torch).
 - **🔒 Fully local** — Model runs on your Mac's GPU/Neural Engine. No cloud.
 - **📋 Clipboard + auto-paste** — Result is copied and pasted at the cursor.
 - **🔊 Audio cue** — Start/stop beeps. Volume-attenuation knob for noisy meetings.
+- **📊 Floating spectrogram waterfall** — A small live spectrogram (32
+  frequency bins × ~5 sec of history, magma-colormapped) pops up next to
+  the text insertion caret (or the mouse cursor, if no caret is exposed)
+  while you hold the hotkey. See your voice's harmonics scroll past in
+  real time and confirm at a glance that the mic is hot.
 - **⚡ Zero key-press latency** — Mic is held open at startup; the beep is a
   truthful "now recording" cue, not a "starting to start" cue.
 - **🔍 Debug audio dump** — Every recording is saved under `debug_audio/`
@@ -65,6 +70,7 @@ the hotkey usually needs tweaking.
 | `attenuate_volume` | `true` | Lower system **output** volume while recording (so background music/Zoom audio doesn't bleed into the mic). |
 | `attenuation_percent` | `10` | Target % of original volume during recording. |
 | `save_debug_audio` | `true` | Save every recording WAV under `./debug_audio/`. |
+| `show_indicator` | `true` | Spawn the floating spectrogram sidecar (`indicator.py`) while recording. Disable if you find it distracting or if it ever misbehaves. |
 | `audio.sample_rate` | `16000` | Parakeet expects 16 kHz mono. Don't change unless you know why. |
 | `audio.channels` | `1` | Mono. |
 | `audio.chunk_size` | `1024` | Frames per PortAudio chunk. 1024 / 16000 ≈ 64 ms per chunk. |
@@ -181,6 +187,40 @@ remapped under System Settings → Keyboard → Dictation.
    action. The WAV in `debug_audio/` lets you literally listen to what the
    model heard.
 
+7. **Spectrum indicator as a sidecar process.**
+   Cocoa requires the main thread for `NSApp.run()`, but `transcribe.py`'s
+   main thread is the cleanup anchor for the listener, capture, and worker
+   threads. Putting the floating panel in its own subprocess
+   (`indicator.py`) keeps that contract intact, talks to it over stdin as
+   one-JSON-per-line messages, and gives us hard failure isolation: if the
+   indicator crashes or the pipe breaks, recording continues. Closing the
+   pipe (parent dying) also self-terminates the child, so we never leak
+   indicator processes.
+
+8. **Anchor at the text caret, not the mouse cursor.**
+   On press the parent asks the macOS Accessibility API
+   (`AXUIElementCopyParameterizedAttributeValue` with
+   `kAXBoundsForRangeParameterizedAttribute`) for the focused element's
+   selected-text bounds and places the indicator just below it. This is
+   what you want 95% of the time: the spectrum appears at the spot where
+   your transcription will land. Apps that don't publish caret info (some
+   Electron apps, certain web text fields, an unfocused desktop) silently
+   fall back to the mouse cursor. AX needs the same Accessibility
+   permission already required for ⌘V auto-paste, so the permission cost
+   is zero. Note: because the indicator is anchored once *at key press*,
+   if you click somewhere else mid-recording the paste will land at the
+   new cursor — that's existing macOS behavior and intentional.
+
+9. **Spectrum is computed in the parent, rendered in the child.**
+   The capture thread already has the raw int16 chunks; it runs an FFT
+   (Hann-windowed, ~70 µs per 1024-sample chunk), bins into 32
+   log-spaced bands from 80 Hz to 7.5 kHz, converts to dB, and ships the
+   32 floats to the child as `{"type":"spectrum","bands":[...]}`. The
+   child treats each message as a new rightmost column of the waterfall
+   — no DSP, just deque maintenance + a 256-entry magma-colormap LUT
+   lookup per cell + `NSBezierPath` rect fills. This split keeps PyObjC
+   out of the audio path and numpy out of the AppKit process.
+
 ---
 
 ## ⌨️ Controls and CLI flags
@@ -266,6 +306,7 @@ and it runs without Python.
 ```
 vibe-code-transcriber/
 ├── transcribe.py        # Main application. All logic lives here.
+├── indicator.py         # Sidecar process: floating VU meter (NSPanel + PyObjC).
 ├── config.yaml          # Runtime configuration.
 ├── detect_key.py        # Standalone helper: print pynput Key/VK for any keypress.
 ├── install.sh           # Brew + venv + pip. One-time setup.

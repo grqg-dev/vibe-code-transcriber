@@ -38,8 +38,40 @@ Each one was a real bug in a prior iteration.
    Daemon threads guarantee the process actually exits.
 
 6. **Block on `self._model_ready.wait()` before showing "Ready".** Users
-   must not be able to press the hotkey before the worker has loaded +
-   warmed up the model.
+ must not be able to press the hotkey before the worker has loaded +
+ warmed up the model.
+
+7. **The spectrogram indicator is a sidecar process, never in-process.**
+ `indicator.py` is spawned by `transcribe.py` and talks JSON-lines over
+ stdin. Do not try to integrate AppKit into the parent: Cocoa requires
+ the main thread for `NSApp.run()`, and the parent's main thread is
+ the listener cleanup anchor. The protocol is:
+
+ ```
+ {"type":"show",     "x":FLOAT,"y":FLOAT}   # AppKit top-left, computed by parent
+ {"type":"spectrum", "bands":[F0..F31]}     # 32 floats in [0,1], log-spaced.
+                                            # Each message = one new rightmost column.
+ {"type":"hide"}                            # hide panel + clear history
+ {"type":"quit"}                            # tear down NSApp and exit
+ ```
+
+ The band count is bound on both sides: `ROWS` in `indicator.py` and
+ `_SPECTRUM_BAND_COUNT` in `transcribe.py` MUST stay equal. New message
+ types should be forward-compatible (unknown types are ignored).
+ Indicator failures must always be soft — `_send_to_indicator` nulls
+ the handle on `BrokenPipeError` and the rest of the app carries on.
+
+8. **Indicator anchor: try caret first, fall back to mouse.** The parent
+ computes the AppKit-coord top-left of the indicator in
+ `_get_indicator_anchor` before sending `show`. The preferred path is
+ the macOS Accessibility API
+ (`AXUIElementCopyParameterizedAttributeValue` →
+ `kAXBoundsForRangeParameterizedAttribute`); Quartz→AppKit Y-flip
+ always uses the main screen's height. The fallback is
+ `NSEvent.mouseLocation()`. The indicator itself does NO offset math —
+ it just sets `frameOrigin` to the requested point (minus PANEL_H for
+ bottom-left framing). If you need to change the anchor logic, do it
+ in the parent, not the child.
 
 ## Commands
 
@@ -79,6 +111,7 @@ print(repr(r.text))
 | File | Role |
 |---|---|
 | `transcribe.py` | The entire app: `VoiceTranscriber` class. |
+| `indicator.py` | Sidecar process. NSPanel + custom NSView that draws the floating scrolling spectrogram (32 freq bins × 80 time cols, magma colormap). Reads `{"type":..., ...}` JSON lines from stdin. Self-terminates on stdin EOF (parent death). Does no DSP — just deque maintenance + per-cell LUT lookup + rect fills. |
 | `config.yaml` | Runtime config. Loaded once. |
 | `detect_key.py` | Standalone: prints what pynput sees for any keypress. Use when the configured `hotkey_code` doesn't match what the user's key emits. |
 | `install.sh` | brew + venv + `pip install -r requirements.txt`. |
@@ -154,3 +187,8 @@ PyAudio. Daemon threads die with the process.
 - MLX: https://ml-explore.github.io/mlx/build/html/index.html
 - parakeet-mlx: https://github.com/senstella/parakeet-mlx
 - pynput macOS quirks: https://pynput.readthedocs.io/en/latest/limitations.html
+- PyObjC (AppKit/NSPanel): https://pyobjc.readthedocs.io/en/latest/
+- `NSWindowStyleMaskNonactivatingPanel` (why the indicator doesn't steal focus):
+  https://developer.apple.com/documentation/appkit/nswindowstylemask/nonactivatingpanel
+- AX caret bounds (`kAXBoundsForRangeParameterizedAttribute`):
+  https://developer.apple.com/documentation/applicationservices/kaxboundsforrangeparameterizedattribute
