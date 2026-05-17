@@ -30,3 +30,9 @@ build/
 
 # Logs
 *.log
+
+# Local Claude Code settings
+.claude/
+
+# Recording debug dumps
+debug_audio/

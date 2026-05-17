@@ -43,14 +43,16 @@ pyinstaller --clean \
     --onefile \
     --name "VoiceTranscriber" \
     --add-data "config.yaml:." \
-    --hidden-import=whisper \
+    --hidden-import=parakeet_mlx \
+    --hidden-import=mlx \
     --hidden-import=pyaudio \
     --hidden-import=pynput \
     --hidden-import=pyperclip \
     --hidden-import=yaml \
     --hidden-import=numpy \
-    --collect-all whisper \
-    --collect-all torch \
+    --hidden-import=soundfile \
+    --collect-all parakeet_mlx \
+    --collect-all mlx \
     transcribe.py
 
 echo
@@ -77,8 +79,8 @@ echo "   3. Run it!"
 echo
 
 echo -e "${YELLOW}⚠️  Note:${NC}"
-echo "   The binary is ~500MB due to including Whisper and PyTorch"
-echo "   First run will still download the Whisper model"
+echo "   The binary bundles parakeet-mlx + MLX runtime (Apple Silicon only)"
+echo "   First run will still download the Parakeet model (~600MB)"
 echo
 
 echo -e "${GREEN}Done! 🎉${NC}"

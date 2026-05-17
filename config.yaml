@@ -1,9 +1,11 @@
 # Voice Transcriber Configuration
 
-# Whisper model to use
-# Options: tiny.en, base.en, small.en, medium.en, large
-# Smaller = faster, larger = more accurate
-whisper_model: "base.en"
+# Parakeet ASR model to use (Apple Silicon / MLX flavor on Hugging Face)
+# Popular options:
+#   mlx-community/parakeet-tdt-0.6b-v3   - Recommended, fast and accurate
+#   mlx-community/parakeet-tdt-0.6b-v2   - Older v2 weights
+#   mlx-community/parakeet-rnnt-1.1b     - Larger RNN-T, higher accuracy
+parakeet_model: "mlx-community/parakeet-tdt-0.6b-v3"
 
 # Auto-paste transcription after copying to clipboard
 auto_paste: true
@@ -16,12 +18,43 @@ attenuate_volume: true
 # Percentage to reduce volume to during recording (default: 10%)
 attenuation_percent: 10
 
-# Hotkey configuration (advanced users only)
-# Default: 176 (macOS dictation key)
-# Run detect_key.py to find custom key codes
-hotkey_code: 176
+# Hotkey configuration. Can be either:
+#   - a pynput Key name as a string, e.g. 'alt_r', 'shift', 'ctrl', 'f13'
+#   - a numeric VK code, e.g. 176 (macOS Fn-dictation key, if remapped)
+# Run detect_key.py to find your key.
+# On macOS Sequoia/Tahoe, the right-option dictation key reports as 'alt_r'.
+hotkey_code: 'alt_r'
+
+# Save a copy of each recorded WAV under ./debug_audio for troubleshooting
+save_debug_audio: true
+
+# Audio post-processing before transcription:
+#   - high-pass at 80 Hz (removes AC hum / mic handling rumble)
+#   - notch filter at 800 Hz (suppresses the start-record beep that
+#     leaks through the speakers into the mic during the first ~100 ms)
+#   - peak normalize to -1 dBFS (consistent loudness regardless of mic gain)
+# Sub-ms cost. Disable if you want to inspect the raw mic signal in
+# debug_audio/ or if you ever change the START beep frequency.
+audio_postprocess: true
+
+# Floating visualization next to the text caret while recording.
+# Spawned as a sidecar subprocess (indicator.py). Non-activating, so it
+# never steals focus and doesn't break auto-paste. Set to false to disable.
+show_indicator: true
+
+# Visualization style for the floating indicator. Options:
+#   eq          - 16-band segmented VU/EQ bars with peak hold. Compact
+#                 (200x40), classic, responsive. Default.
+#   spectrogram - Scrolling waterfall (32 freq bins x ~5 sec time history)
+#                 with the magma colormap. Larger panel (240x72).
+#                 Shows speech harmonics & sibilants nicely.
+#   orb         - Square 100x100 panel with a pulsing inner core surrounded
+#                 by a circular oscilloscope outline that wiggles with the
+#                 live waveform. macOS-y, distinctive.
+indicator_style: eq
 
 # Audio recording settings
+# Note: Parakeet expects 16kHz mono audio
 audio:
   sample_rate: 16000
   channels: 1

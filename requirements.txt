@@ -1,6 +1,11 @@
-openai-whisper
+parakeet-mlx
 pyaudio
 pyperclip
 pynput
 pyyaml
+numpy
+soundfile
 pyinstaller
+# Used by indicator.py (NSPanel VU meter) and by transcribe.py to read
+# the cursor position via NSEvent.mouseLocation() without shelling out.
+pyobjc-framework-Cocoa
