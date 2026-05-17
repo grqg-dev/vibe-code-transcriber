@@ -28,6 +28,15 @@ hotkey_code: 'alt_r'
 # Save a copy of each recorded WAV under ./debug_audio for troubleshooting
 save_debug_audio: true
 
+# Audio post-processing before transcription:
+#   - high-pass at 80 Hz (removes AC hum / mic handling rumble)
+#   - notch filter at 800 Hz (suppresses the start-record beep that
+#     leaks through the speakers into the mic during the first ~100 ms)
+#   - peak normalize to -1 dBFS (consistent loudness regardless of mic gain)
+# Sub-ms cost. Disable if you want to inspect the raw mic signal in
+# debug_audio/ or if you ever change the START beep frequency.
+audio_postprocess: true
+
 # Floating visualization next to the text caret while recording.
 # Spawned as a sidecar subprocess (indicator.py). Non-activating, so it
 # never steals focus and doesn't break auto-paste. Set to false to disable.
