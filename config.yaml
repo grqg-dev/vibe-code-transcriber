@@ -37,10 +37,20 @@ save_debug_audio: true
 # debug_audio/ or if you ever change the START beep frequency.
 audio_postprocess: true
 
-# Floating visualization next to the text caret while recording.
+# Floating visualization next to your cursor while recording.
 # Spawned as a sidecar subprocess (indicator.py). Non-activating, so it
 # never steals focus and doesn't break auto-paste. Set to false to disable.
 show_indicator: true
+
+# Where to anchor the floating indicator each time it appears:
+#   mouse - at the mouse cursor (default). Works in every app, no
+#           Accessibility round-trip on the keypress path.
+#   caret - at the text-insertion caret via the macOS Accessibility API,
+#           with a mouse fallback. Lands the panel where the transcription
+#           will be pasted, but only in apps that publish their caret rect
+#           (most native AppKit apps do; many Electron / browser chrome
+#           surfaces don't, and those silently fall back to mouse).
+indicator_anchor: mouse
 
 # Visualization style for the floating indicator. Options:
 #   eq          - 16-band segmented VU/EQ bars with peak hold. Compact
