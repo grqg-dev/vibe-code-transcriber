@@ -17,9 +17,12 @@ fast cold start, no CUDA, no torch).
 - **📋 Clipboard + auto-paste** — Result is copied and pasted at the cursor.
 - **🔊 Audio cue** — Start/stop beeps. Volume-attenuation knob for noisy meetings.
 - **📊 Floating visualization** — A small audio visualization pops up next
-  to the text insertion caret (or the mouse cursor, if no caret is exposed)
-  while you hold the hotkey. Three styles, selectable via `indicator_style`
-  in `config.yaml`:
+  to your cursor while you hold the hotkey. By default it anchors at the
+  **mouse cursor** (works in every app); flip `indicator_anchor: caret` in
+  `config.yaml` (or `--anchor caret`) to anchor it at the text insertion
+  caret instead, with mouse as automatic fallback for apps that don't
+  publish caret bounds. Three styles, selectable via `indicator_style` in
+  `config.yaml`:
   - `eq` (default) — 16-band segmented VU bars with peak-hold.
   - `spectrogram` — Scrolling magma-colormapped waterfall (32 freq × ~5 sec).
   - `orb` — Pulsing core with a circular oscilloscope outline.
@@ -74,6 +77,7 @@ the hotkey usually needs tweaking.
 | `save_debug_audio` | `true` | Save every recording WAV under `./debug_audio/`. |
 | `show_indicator` | `true` | Spawn the floating visualization sidecar (`indicator.py`) while recording. Disable if you find it distracting or if it ever misbehaves. |
 | `indicator_style` | `'eq'` | Visualization style. One of `'eq'` (16-band VU bars), `'spectrogram'` (scrolling waterfall), `'orb'` (pulsing core + circular oscilloscope). |
+| `indicator_anchor` | `'mouse'` | Where the indicator pops up. `'mouse'` anchors at the mouse cursor (universal, no Accessibility round-trip on the keypress path). `'caret'` anchors at the focused text-insertion caret via the macOS Accessibility API, falling back to mouse when the focused app doesn't publish a caret rect (Electron, some browser chrome). |
 | `audio.sample_rate` | `16000` | Parakeet expects 16 kHz mono. Don't change unless you know why. |
 | `audio.channels` | `1` | Mono. |
 | `audio.chunk_size` | `1024` | Frames per PortAudio chunk. 1024 / 16000 ≈ 64 ms per chunk. |
@@ -200,19 +204,26 @@ remapped under System Settings → Keyboard → Dictation.
    pipe (parent dying) also self-terminates the child, so we never leak
    indicator processes.
 
-8. **Anchor at the text caret, not the mouse cursor.**
-   On press the parent asks the macOS Accessibility API
-   (`AXUIElementCopyParameterizedAttributeValue` with
-   `kAXBoundsForRangeParameterizedAttribute`) for the focused element's
-   selected-text bounds and places the indicator just below it. This is
-   what you want 95% of the time: the spectrum appears at the spot where
-   your transcription will land. Apps that don't publish caret info (some
-   Electron apps, certain web text fields, an unfocused desktop) silently
-   fall back to the mouse cursor. AX needs the same Accessibility
-   permission already required for ⌘V auto-paste, so the permission cost
-   is zero. Note: because the indicator is anchored once *at key press*,
-   if you click somewhere else mid-recording the paste will land at the
-   new cursor — that's existing macOS behavior and intentional.
+8. **Anchor at the mouse cursor by default; caret as opt-in.**
+   On press the parent computes an AppKit-coord top-left for the panel
+   based on `indicator_anchor`:
+   - `'mouse'` (default) just reads `NSEvent.mouseLocation()` with a
+     small offset. This works in literally every app, has zero
+     Accessibility round-trip on the keypress path, and matches the
+     visual intuition of "the meter pops up where I'm pointing."
+   - `'caret'` asks the macOS Accessibility API
+     (`AXUIElementCopyParameterizedAttributeValue` with
+     `kAXBoundsForRangeParameterizedAttribute`) for the focused
+     element's selected-text bounds and places the panel just below it,
+     so the spectrum lands at the spot where your transcription will
+     get pasted. Apps that don't publish caret info (some Electron
+     apps, certain web text fields, an unfocused desktop) silently fall
+     back to the mouse path. AX needs the same Accessibility permission
+     already required for ⌘V auto-paste, so the permission cost is
+     zero when it works.
+   Either way the indicator is anchored once *at key press*: if you
+   click somewhere else mid-recording the paste will land at the new
+   cursor — that's existing macOS behavior and intentional.
 
 9. **DSP runs in the parent, drawing runs in the child.**
    The capture thread already has the raw int16 chunks. Depending on
@@ -236,6 +247,8 @@ remapped under System Settings → Keyboard → Dictation.
 | Verbose logging | `./run.sh -v` or `VERBOSE=1 ./run.sh` |
 | Real-time typing mode | `./run.sh --real-time` (experimental — see [caveats](#real-time-mode)) |
 | Custom config | `./run.sh --config /path/to/other.yaml` |
+| Override indicator style for one run | `./run.sh --style eq\|spectrogram\|orb` |
+| Override indicator anchor for one run | `./run.sh --anchor mouse\|caret` |
 
 ### Real-time mode
 
