@@ -996,6 +996,24 @@ class VoiceTranscriber:
                 pass
         self._indicator = None
 
+    def _request_shutdown_fast(self):
+        """Release the persistent mic grab and unblock ``stream.read()`` quickly.
+
+        The capture thread drains PortAudio continually; shutting down used to
+        wait on ``Listener.join()`` first, leaving the interpreter stuck in two
+        long native waits ``join`` doesn't poll out of reliably. Ctrl+C installs
+        a handler that must run between Python bytecode boundaries — short-timeout
+        ``join`` polling plus stopping the stream here fixes that deadlock.
+        """
+        self.is_recording = False
+        self._capture_running = False
+        try:
+            if self.stream is not None:
+                self.stream.stop_stream()
+        except Exception as e:
+            dbg(f"_request_shutdown_fast stop_stream failed: "
+                f"{type(e).__name__}: {e}")
+
     def _compute_spectrum_bands(self, samples_int16):
         """Log-spaced frequency band magnitudes (0..1) for one audio chunk.
 
@@ -1282,14 +1300,18 @@ class VoiceTranscriber:
             )
             listener.start()
 
-            # pynput's Quartz event tap on macOS swallows SIGINT before it
-            # reaches the Python main thread, so install our own handler that
-            # stops the listener and lets join() return.
+            # Quartz + PortAudio swallow or delay SIGINT when the main thread
+            # sits indefinitely in native wait; polled ``join`` windows plus a
+            # handler that freezes the persistent mic grab let Ctrl+C reliably
+            # interrupt (see ``_request_shutdown_fast``).
             def _sigint(signum, frame):
                 print("\n\n👋 Ctrl+C received, shutting down...\n", flush=True)
-                self.is_recording = False
-                self._capture_running = False
+                self._request_shutdown_fast()
                 self.restore_system_volume()
+                try:
+                    self._transcription_queue.put_nowait(None)
+                except Exception:
+                    pass
                 self._shutdown_indicator()
                 if listener is not None:
                     listener.stop()
@@ -1297,13 +1319,21 @@ class VoiceTranscriber:
             signal.signal(signal.SIGINT, _sigint)
             signal.signal(signal.SIGTERM, _sigint)
 
-            dbg("keyboard listener running (join)")
+            # Indefinite ``join()`` traps the main thread in native pthread code;
+            # Ctrl+C handlers only run reliably when bytecode executes between
+            # bounded waits — see `_request_shutdown_fast` docstring.
+            dbg("keyboard listener running (polled join)")
+            while listener.is_alive():
+                listener.join(timeout=0.25)
             listener.join()
         except KeyboardInterrupt:
             # Belt-and-suspenders: if the signal does sneak through, still tidy up.
             print("\n\n👋 Exiting...\n", flush=True)
-            self.is_recording = False
-            self._capture_running = False
+            self._request_shutdown_fast()
+            try:
+                self._transcription_queue.put_nowait(None)
+            except Exception:
+                pass
             self.restore_system_volume()
             self._shutdown_indicator()
             if listener is not None:
@@ -1316,8 +1346,8 @@ class VoiceTranscriber:
                 import traceback
                 traceback.print_exc()
 
-        # Cleanup
-        self._capture_running = False
+        # Cleanup (may repeat work already done via ``_sigint`` / Ctrl+C.)
+        self._request_shutdown_fast()
         self.restore_system_volume()
         self._shutdown_indicator()
         try:
