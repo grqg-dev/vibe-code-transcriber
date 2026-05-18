@@ -64,7 +64,8 @@ class VoiceTranscriber:
     STOP_BEEP_HZ = 600
 
     def __init__(self, config_path="config.yaml", real_time_mode=False,
-                 indicator_style_override=None):
+                 indicator_style_override=None,
+                 indicator_anchor_override=None):
         # Load configuration
         self.config = self.load_config(config_path)
 
@@ -188,6 +189,26 @@ class VoiceTranscriber:
         self._waveform_length = 128 if self.indicator_style == 'orb' else 0
         self._indicator = None
 
+        # Where to anchor the indicator panel each time it appears:
+        #   'mouse' - at the mouse cursor (current default; works everywhere,
+        #             zero permission cost, no per-app surprises).
+        #   'caret' - at the text-insertion caret via the Accessibility API,
+        #             with mouse as fallback. Lands the panel right where the
+        #             transcription will be pasted, but only in apps that
+        #             publish their caret rect (most native AppKit apps do;
+        #             a lot of Electron / browser chrome doesn't).
+        # CLI --anchor overrides config; both fall back to 'mouse'.
+        self.indicator_anchor = (
+            indicator_anchor_override
+            or self.config.get('indicator_anchor', 'mouse')
+        )
+        if self.indicator_anchor not in ('mouse', 'caret'):
+            print(f"⚠️  Unknown indicator_anchor {self.indicator_anchor!r}, "
+                  f"falling back to 'mouse'", flush=True)
+            self.indicator_anchor = 'mouse'
+        if indicator_anchor_override:
+            dbg(f"indicator_anchor overridden via CLI: {self.indicator_anchor}")
+
     def load_config(self, config_path):
         """Load configuration from YAML file"""
         try:
@@ -212,6 +233,7 @@ class VoiceTranscriber:
             'save_debug_audio': True,
             'show_indicator': True,
             'indicator_style': 'eq',
+            'indicator_anchor': 'mouse',
             'audio_postprocess': True,
             'audio': {
                 'sample_rate': 16000,
@@ -836,24 +858,22 @@ class VoiceTranscriber:
         """Return the (x, y) AppKit-coord top-left where the indicator
         should appear, or None if we can't compute one.
 
-        Strategy:
-          1. Ask the Accessibility API for the focused element's text
-             caret rect. Land the indicator just below + slightly right
-             of the caret. This is what the user wants in 95% of cases —
-             the spectrum appears at the spot where their transcription
-             is going to land.
-          2. Fall back to NSEvent.mouseLocation() with a small offset
-             from the I-beam.
+        The strategy depends on `self.indicator_anchor`:
+          - 'mouse' (default): just use NSEvent.mouseLocation(). Works
+            in every app, no Accessibility round-trip on the press path.
+          - 'caret': ask the Accessibility API for the focused element's
+            text caret rect and land the indicator just below + slightly
+            right of it. Falls back to the mouse position when the focused
+            app doesn't publish a caret (Electron, browser chrome, etc.).
 
-        The AX path needs the same Accessibility permission already
-        required for the simulated ⌘V auto-paste, so the permission cost
-        is zero. Apps that don't publish their text caret correctly
-        (Electron apps, some browsers' chrome) silently fall back to the
-        mouse cursor.
+        The caret path needs the same Accessibility permission already
+        required for the simulated ⌘V auto-paste, so when it works the
+        permission cost is zero.
         """
-        caret = self._caret_top_left_appkit()
-        if caret is not None:
-            return caret
+        if self.indicator_anchor == 'caret':
+            caret = self._caret_top_left_appkit()
+            if caret is not None:
+                return caret
         return self._mouse_top_left_appkit()
 
     def _caret_top_left_appkit(self):
@@ -1338,6 +1358,15 @@ if __name__ == "__main__":
         help='Override indicator_style from config.yaml for this run only '
              '(eq, spectrogram, or orb)',
     )
+    parser.add_argument(
+        '--anchor', '--indicator-anchor',
+        choices=['mouse', 'caret'],
+        default=None,
+        help='Override indicator_anchor from config.yaml for this run only. '
+             '"mouse" pops the indicator at the mouse cursor (default); '
+             '"caret" pops it at the text-insertion caret (Accessibility API, '
+             'with mouse as fallback).',
+    )
 
     args = parser.parse_args()
 
@@ -1350,6 +1379,7 @@ if __name__ == "__main__":
             config_path=args.config,
             real_time_mode=args.real_time,
             indicator_style_override=args.style,
+            indicator_anchor_override=args.anchor,
         )
         transcriber.run()
     except KeyboardInterrupt:
