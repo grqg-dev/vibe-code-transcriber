@@ -65,17 +65,26 @@ Each one was a real bug in a prior iteration.
  STYLES entry in `indicator.py`, plus updating `__init__`'s style
  validator and the `_capture_loop` branch in `transcribe.py`.
 
-8. **Indicator anchor: try caret first, fall back to mouse.** The parent
+8. **Indicator anchor: mode-selected, with mouse as default.** The parent
  computes the AppKit-coord top-left of the indicator in
- `_get_indicator_anchor` before sending `show`. The preferred path is
- the macOS Accessibility API
+ `_get_indicator_anchor` before sending `show`. `self.indicator_anchor`
+ (config `indicator_anchor`, CLI `--anchor`, default `'mouse'`) picks
+ the strategy:
+ - `'mouse'` → straight to `NSEvent.mouseLocation()` (with a +16/-8
+ offset so the panel doesn't sit on the I-beam). Works in every app,
+ zero AX round-trip on the keypress hot path.
+ - `'caret'` → try the macOS Accessibility API
  (`AXUIElementCopyParameterizedAttributeValue` →
- `kAXBoundsForRangeParameterizedAttribute`); Quartz→AppKit Y-flip
- always uses the main screen's height. The fallback is
- `NSEvent.mouseLocation()`. The indicator itself does NO offset math —
- it just sets `frameOrigin` to the requested point (minus PANEL_H for
- bottom-left framing). If you need to change the anchor logic, do it
- in the parent, not the child.
+ `kAXBoundsForRangeParameterizedAttribute`) for the focused element's
+ selected-text bounds; place the panel just below it. Falls back to
+ the mouse path if AX returns nothing.
+ Quartz→AppKit Y-flip always uses the main screen's height. The
+ indicator itself does NO offset math — it just sets `frameOrigin` to
+ the requested point (minus PANEL_H for bottom-left framing). If you
+ need to change the anchor logic, do it in the parent, not the child.
+ Adding a new anchor mode means: a new branch in `_get_indicator_anchor`,
+ plus updating `__init__`'s anchor validator and the `--anchor` CLI
+ `choices=[...]`.
 
 ## Commands
 
