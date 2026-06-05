@@ -47,11 +47,23 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 # Verbose debug logging — toggle with --verbose flag or VERBOSE=1 env var
 VERBOSE = os.environ.get("VERBOSE", "0") == "1"
 
+def _timestamp():
+    """Wall clock for verbose debug lines."""
+    now = datetime.now()
+    return now.strftime('%H:%M:%S.') + f'{now.microsecond // 1000:03d}'
+
 
 def dbg(msg):
-    """Print a debug line if VERBOSE is on. Flushes immediately."""
+    """Print a timestamped debug line if VERBOSE is on. Flushes immediately."""
     if VERBOSE:
-        print(f"🐛 [debug] {msg}", flush=True)
+        print(f"🐛 [{_timestamp()}] {msg}", flush=True)
+
+
+def dbg_elapsed(label, t0):
+    """Log elapsed milliseconds since t0 (perf_counter) when verbose."""
+    if VERBOSE:
+        ms = (time.perf_counter() - t0) * 1000
+        dbg(f"{label}: {ms:.1f}ms")
 
 
 class VoiceTranscriber:
@@ -253,6 +265,7 @@ class VoiceTranscriber:
             dbg(f"play_beep({frequency}Hz) skipped — audio_feedback disabled")
             return
 
+        t0 = time.perf_counter()
         dbg(f"play_beep({frequency}Hz, {duration}s) starting")
         try:
             sample_rate = 44100
@@ -270,8 +283,9 @@ class VoiceTranscriber:
             stream.write(audio_data.tobytes())
             stream.stop_stream()
             stream.close()
-            dbg(f"play_beep({frequency}Hz) finished")
+            dbg_elapsed(f"play_beep({frequency}Hz)", t0)
         except Exception as e:
+            dbg_elapsed(f"play_beep({frequency}Hz) FAILED", t0)
             print(f"⚠️  Beep failed ({frequency}Hz): {type(e).__name__}: {e}", flush=True)
 
     def get_system_volume(self):
@@ -280,6 +294,7 @@ class VoiceTranscriber:
             return None
 
         try:
+            t0 = time.perf_counter()
             result = subprocess.run(
                 ['osascript', '-e', 'output volume of (get volume settings)'],
                 capture_output=True,
@@ -287,9 +302,12 @@ class VoiceTranscriber:
                 timeout=1
             )
             if result.returncode == 0:
-                return int(result.stdout.strip())
-        except Exception:
-            pass
+                vol = int(result.stdout.strip())
+                dbg_elapsed(f"get_system_volume → {vol}%", t0)
+                return vol
+            dbg_elapsed("get_system_volume failed (osascript rc)", t0)
+        except Exception as e:
+            dbg(f"get_system_volume error: {type(e).__name__}: {e}")
         return None
 
     def set_system_volume(self, volume):
@@ -299,13 +317,16 @@ class VoiceTranscriber:
 
         try:
             volume = max(0, min(100, int(volume)))  # Clamp to 0-100
+            t0 = time.perf_counter()
             subprocess.run(
                 ['osascript', '-e', f'set volume output volume {volume}'],
                 capture_output=True,
                 timeout=1
             )
+            dbg_elapsed(f"set_system_volume({volume}%)", t0)
             return True
-        except Exception:
+        except Exception as e:
+            dbg(f"set_system_volume({volume}) error: {type(e).__name__}: {e}")
             return False
 
     def attenuate_system_volume(self):
@@ -334,6 +355,7 @@ class VoiceTranscriber:
 
     def check_microphone_access(self):
         """Check if microphone is accessible"""
+        t0 = time.perf_counter()
         try:
             test_stream = self.audio.open(
                 format=self.FORMAT,
@@ -343,8 +365,10 @@ class VoiceTranscriber:
                 frames_per_buffer=self.CHUNK
             )
             test_stream.close()
+            dbg_elapsed("check_microphone_access OK", t0)
             return True
         except Exception as e:
+            dbg_elapsed(f"check_microphone_access FAILED ({type(e).__name__})", t0)
             return False
 
     def load_model(self):
@@ -368,6 +392,7 @@ class VoiceTranscriber:
             self.model = from_pretrained(self.model_name)
             dbg(f"from_pretrained took {time.time() - t_load:.1f}s")
 
+            dbg_elapsed("load_model total", t0)
             print(f"✅ Model loaded successfully in {time.time() - t0:.1f}s\n", flush=True)
         except Exception as e:
             print(f"❌ Error loading Parakeet model: {type(e).__name__}: {e}", flush=True)
@@ -401,13 +426,17 @@ class VoiceTranscriber:
                     os.remove(tmp_path)
                 except OSError:
                     pass
+            dbg_elapsed("warmup_model total", t0)
             print(f"✅ Model warm ({time.time() - t0:.1f}s)\n", flush=True)
         except Exception as e:
+            dbg_elapsed("warmup_model FAILED", t0)
             print(f"⚠️  Warmup failed (non-fatal): {type(e).__name__}: {e}", flush=True)
 
     def _transcribe_file(self, wav_path):
         """Run Parakeet (MLX) inference on a WAV file and return the text."""
+        t0 = time.perf_counter()
         result = self.model.transcribe(wav_path)
+        dbg_elapsed(f"MLX transcribe({Path(wav_path).name})", t0)
         # parakeet-mlx returns an AlignedResult with a `.text` attribute.
         # Fall back to str() in case the API ever yields a bare string.
         if hasattr(result, "text"):
@@ -416,7 +445,8 @@ class VoiceTranscriber:
 
     def start_recording(self):
         """Begin recording. Mic stream is already live — just flip the flag."""
-        dbg("start_recording called")
+        t_total = time.perf_counter()
+        dbg("start_recording entered")
         if self.is_recording:
             dbg("start_recording: already recording, ignoring")
             return
@@ -426,6 +456,7 @@ class VoiceTranscriber:
         self.audio_data = []
         self.record_start_time = time.time()
         self.last_transcribed_text = ""
+        self._first_chunk_logged = False
         if self.real_time_mode:
             # Drain any stale queued chunks from the previous session.
             while not self.data_queue.empty():
@@ -434,20 +465,24 @@ class VoiceTranscriber:
                 except Exception:
                     break
         self.is_recording = True
+        dbg_elapsed("start_recording → is_recording=True", t_total)
 
         if self.real_time_mode:
+            t_rt = time.perf_counter()
             self.transcription_thread = threading.Thread(
                 target=self._real_time_transcribe, daemon=True
             )
             self.transcription_thread.start()
-            dbg("real-time transcription thread started")
+            dbg_elapsed("real-time transcription thread spawn", t_rt)
 
         # Pop the floating spectrum at the text-caret position (preferred)
         # or the mouse cursor (fallback) BEFORE the beep so the visual lines
         # up with the audio cue. _get_indicator_anchor returns AppKit-coord
         # top-left, exactly what the indicator expects.
         if self._indicator is not None:
+            t_anchor = time.perf_counter()
             anchor = self._get_indicator_anchor()
+            dbg_elapsed(f"indicator anchor ({self.indicator_anchor})", t_anchor)
             if anchor is not None:
                 self._send_to_indicator(
                     {"type": "show", "x": float(anchor[0]), "y": float(anchor[1])}
@@ -472,6 +507,7 @@ class VoiceTranscriber:
             dbg("beep_then_attenuate thread done")
 
         threading.Thread(target=beep_then_attenuate, daemon=True).start()
+        dbg_elapsed("start_recording total (listener thread)", t_total)
 
     def _capture_loop(self):
         """Persistent mic reader.
@@ -518,6 +554,11 @@ class VoiceTranscriber:
                             )
                 except Exception as e:
                     dbg(f"indicator send failed: {type(e).__name__}: {e}")
+
+            if not self._first_chunk_logged:
+                self._first_chunk_logged = True
+                press_to_chunk_ms = (time.perf_counter() - self._press_perf) * 1000
+                dbg(f"first capture chunk after press: {press_to_chunk_ms:.1f}ms")
 
             if self.real_time_mode:
                 self.data_queue.put(data)
@@ -575,7 +616,11 @@ class VoiceTranscriber:
                                 wf.close()
 
                             try:
+                                t_infer = time.perf_counter()
                                 new_text = self._transcribe_file(tmp_path)
+                                dbg(f"real-time pass: {audio_duration:.1f}s audio → "
+                                    f"{len(new_text)} chars")
+                                dbg_elapsed("real-time pass total", t_infer)
                             finally:
                                 try:
                                     os.remove(tmp_path)
@@ -632,22 +677,29 @@ class VoiceTranscriber:
 
     def stop_recording(self):
         """Stop recording and hand the buffer off to the transcription worker."""
-        dbg("stop_recording called")
+        t_total = time.perf_counter()
+        self._release_perf = t_total
+        dbg("stop_recording entered")
         if not self.is_recording:
             dbg("stop_recording: not recording, ignoring")
             return
 
         self.is_recording = False
         duration = time.time() - self.record_start_time
+        dbg_elapsed("stop_recording → is_recording=False", t_total)
 
         # Hide the VU meter immediately on release — the visual should
         # disappear with the keypress, not after transcription finishes.
         if self._indicator is not None:
+            t_hide = time.perf_counter()
             self._send_to_indicator({"type": "hide"})
+            dbg_elapsed("stop_recording: indicator hide", t_hide)
 
         # Restore system volume immediately so the user hears the beep at
         # their normal level.
+        t_vol = time.perf_counter()
         self.restore_system_volume()
+        dbg_elapsed("stop_recording: restore volume", t_vol)
 
         # Stop beep async — doesn't affect capture; mic stays open.
         threading.Thread(target=lambda: self.play_beep(self.STOP_BEEP_HZ, 0.1), daemon=True).start()
@@ -658,13 +710,18 @@ class VoiceTranscriber:
             if self.transcription_thread:
                 print("⏳ Finishing transcription...")
                 sys.stdout.flush()
+                t_join = time.perf_counter()
                 self.transcription_thread.join(timeout=5.0)
+                dbg_elapsed("stop_recording: real-time thread join", t_join)
                 print("─" * 60 + "\n")
         else:
             if self.audio_data:
+                t_handoff = time.perf_counter()
                 self.transcribe_audio()
+                dbg_elapsed("stop_recording: transcribe_audio handoff", t_handoff)
             else:
                 print("❌ No audio recorded\n")
+        dbg_elapsed("stop_recording total (listener thread)", t_total)
 
     def transcribe_audio(self):
         """Write the recorded audio to WAV and hand it off to the worker.
@@ -673,7 +730,14 @@ class VoiceTranscriber:
         on_release). Doing the actual MLX call here would crash because MLX
         streams are per-thread — see _transcription_worker.
         """
+        t_total = time.perf_counter()
+        t_join = time.perf_counter()
         raw_bytes = b''.join(self.audio_data)
+        dbg_elapsed(
+            f"transcribe_audio: join {len(self.audio_data)} chunks "
+            f"({len(raw_bytes) / 1024:.1f} kB)",
+            t_join,
+        )
         sample_width = self.audio.get_sample_size(self.FORMAT)
         audio_seconds = len(raw_bytes) / (sample_width * self.CHANNELS * self.RATE)
         print(
@@ -699,6 +763,7 @@ class VoiceTranscriber:
                       f"{type(e).__name__}: {e}", flush=True)
 
         # Write to a temp WAV that the worker will transcribe and then delete.
+        t_wav = time.perf_counter()
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
             temp_filename = temp_file.name
         try:
@@ -708,7 +773,9 @@ class VoiceTranscriber:
             wf.setframerate(self.RATE)
             wf.writeframes(raw_bytes)
             wf.close()
+            dbg_elapsed(f"transcribe_audio: write WAV {temp_filename}", t_wav)
         except Exception as e:
+            dbg_elapsed("transcribe_audio: write WAV FAILED", t_wav)
             print(f"❌ Failed to write recording WAV: {type(e).__name__}: {e}", flush=True)
             return
 
@@ -718,14 +785,22 @@ class VoiceTranscriber:
                 f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
             )
             try:
+                t_copy = time.perf_counter()
                 with open(temp_filename, 'rb') as src, open(debug_path, 'wb') as dst:
                     dst.write(src.read())
+                dbg_elapsed(f"transcribe_audio: debug copy → {debug_path.name}", t_copy)
                 print(f"🔍 Debug audio saved: {debug_path}", flush=True)
             except Exception as e:
                 dbg(f"failed to write debug audio: {type(e).__name__}: {e}")
 
-        dbg(f"enqueuing transcription job: {temp_filename}")
-        self._transcription_queue.put(temp_filename)
+        job = {
+            "path": temp_filename,
+            "enqueued_at": time.perf_counter(),
+            "audio_s": audio_seconds,
+        }
+        dbg(f"enqueuing transcription job: {temp_filename} ({audio_seconds:.1f}s audio)")
+        self._transcription_queue.put(job)
+        dbg_elapsed("transcribe_audio total", t_total)
 
     def _transcription_worker(self):
         """Dedicated thread that owns the MLX model and runs all inference.
@@ -752,31 +827,49 @@ class VoiceTranscriber:
         dbg("transcription worker ready")
 
         while True:
-            wav_path = self._transcription_queue.get()
-            if wav_path is None:
+            job = self._transcription_queue.get()
+            if job is None:
                 dbg("transcription worker got shutdown sentinel")
                 break
+            wav_path = job["path"]
+            queue_wait_ms = (time.perf_counter() - job["enqueued_at"]) * 1000
+            dbg(
+                f"worker dequeued job: {Path(wav_path).name} "
+                f"({job['audio_s']:.1f}s audio, queue wait {queue_wait_ms:.1f}ms)"
+            )
+            release_ms = None
+            if hasattr(self, '_release_perf'):
+                release_ms = (time.perf_counter() - self._release_perf) * 1000
+                dbg(f"release→worker dequeue: {release_ms:.1f}ms")
+            t_job = time.perf_counter()
             try:
-                self._process_transcription(wav_path)
+                self._process_transcription(wav_path, release_ms=release_ms)
             except Exception as e:
                 print(f"❌ Worker transcription error: {type(e).__name__}: {e}", flush=True)
                 if VERBOSE:
                     import traceback
                     traceback.print_exc()
             finally:
+                dbg_elapsed("worker job total", t_job)
                 try:
                     os.remove(wav_path)
                 except OSError:
                     pass
 
-    def _process_transcription(self, wav_path):
+    def _process_transcription(self, wav_path, release_ms=None):
         """Run inference on a WAV path and emit text + clipboard + paste."""
+        t_total = time.perf_counter()
         print("⏳ Processing transcription...", flush=True)
-        start_time = time.time()
+        if release_ms is not None:
+            dbg(f"_process_transcription: {release_ms:.1f}ms since key release")
+
+        t_infer = time.perf_counter()
         text = self._transcribe_file(wav_path)
-        transcribe_time = time.time() - start_time
+        transcribe_time = time.perf_counter() - t_infer
+        dbg_elapsed("_process_transcription: MLX inference", t_infer)
 
         if not text:
+            dbg_elapsed("_process_transcription total (no speech)", t_total)
             print("⚠️  No speech detected in audio\n", flush=True)
             return
 
@@ -788,22 +881,31 @@ class VoiceTranscriber:
         print(f"⏱️  Transcribed in {transcribe_time:.1f}s")
 
         try:
+            t_clip = time.perf_counter()
             pyperclip.copy(text)
+            dbg_elapsed("_process_transcription: clipboard", t_clip)
             print("✅ Copied to clipboard")
         except Exception as e:
+            dbg(f"clipboard error: {type(e).__name__}: {e}")
             print(f"⚠️  Could not copy to clipboard: {e}")
 
         if self.auto_paste:
             try:
+                t_paste = time.perf_counter()
                 time.sleep(0.2)
                 with self.kb_controller.pressed(Key.cmd):
                     self.kb_controller.press('v')
                     self.kb_controller.release('v')
+                dbg_elapsed("_process_transcription: auto-paste (incl 200ms delay)", t_paste)
                 print("✅ Auto-pasted")
             except Exception as e:
+                dbg(f"auto-paste error: {type(e).__name__}: {e}")
                 print(f"⚠️  Could not auto-paste: {e}")
                 print("   Enable Accessibility permissions in System Preferences")
 
+        if release_ms is not None:
+            dbg_elapsed("release→paste complete", self._release_perf)
+        dbg_elapsed("_process_transcription total", t_total)
         print("─" * 60 + "\n", flush=True)
 
     def _spawn_indicator(self):
@@ -818,6 +920,7 @@ class VoiceTranscriber:
             dbg("indicator disabled via config (show_indicator: false)")
             return
         try:
+            t0 = time.perf_counter()
             self._indicator = subprocess.Popen(
                 [sys.executable,
                  str(Path(__file__).parent / 'indicator.py'),
@@ -828,7 +931,11 @@ class VoiceTranscriber:
                 text=True,
                 bufsize=1,  # line-buffered so each JSON line flushes immediately
             )
-            dbg(f"indicator subprocess started (pid={self._indicator.pid}, style={self.indicator_style})")
+            dbg_elapsed(
+                f"indicator subprocess started (pid={self._indicator.pid}, "
+                f"style={self.indicator_style})",
+                t0,
+            )
         except Exception as e:
             print(f"⚠️  Indicator failed to start (non-fatal): "
                   f"{type(e).__name__}: {e}", flush=True)
@@ -847,9 +954,14 @@ class VoiceTranscriber:
         proc = self._indicator
         if proc is None or proc.stdin is None:
             return
+        msg_type = msg.get("type")
+        log_ipc = msg_type in ("show", "hide", "quit")
+        t0 = time.perf_counter() if log_ipc else None
         try:
             proc.stdin.write(json.dumps(msg) + "\n")
             proc.stdin.flush()
+            if log_ipc:
+                dbg_elapsed(f"indicator ipc ({msg_type})", t0)
         except (BrokenPipeError, OSError, ValueError) as e:
             dbg(f"indicator pipe broken ({type(e).__name__}: {e}) — disabling")
             self._indicator = None
@@ -1197,15 +1309,14 @@ class VoiceTranscriber:
 
     def on_press(self, key):
         """Callback for key press events"""
-        if VERBOSE:
-            dbg(f"on_press: {self._describe_key(key)} (target={self._describe_key(self.record_key)})")
+        dbg(f"on_press: {self._describe_key(key)} (target={self._describe_key(self.record_key)})")
         if key == self.record_key:
+            self._press_perf = time.perf_counter()
             self.start_recording()
 
     def on_release(self, key):
         """Callback for key release events"""
-        if VERBOSE:
-            dbg(f"on_release: {self._describe_key(key)}")
+        dbg(f"on_release: {self._describe_key(key)}")
         if key == self.record_key:
             self.stop_recording()
 
@@ -1267,23 +1378,29 @@ class VoiceTranscriber:
             sys.exit(1)
 
         self._capture_running = True
+        t_cap = time.perf_counter()
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
+        dbg_elapsed("capture thread spawned", t_cap)
 
         # MLX streams are per-thread, so spin up a dedicated worker that owns
         # the model from load through inference. Block here until it signals
         # ready so the user only sees the "Ready" banner once we can transcribe.
         print("", flush=True)
+        t_worker = time.perf_counter()
         self._worker_thread = threading.Thread(
             target=self._transcription_worker, daemon=True
         )
         self._worker_thread.start()
         self._model_ready.wait()
+        dbg_elapsed("worker ready (_model_ready.wait)", t_worker)
 
         # Spawn the floating VU meter sidecar AFTER the model is ready so its
         # startup doesn't bottleneck the "Ready" banner, and BEFORE the
         # listener starts so the first keypress already has a live pipe.
+        t_ind = time.perf_counter()
         self._spawn_indicator()
+        dbg_elapsed("indicator spawn", t_ind)
 
         print("═" * 60, flush=True)
         print("✅ Ready! Press and hold the dictation key to start...", flush=True)
