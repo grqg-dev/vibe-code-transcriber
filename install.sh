@@ -88,7 +88,33 @@ pip3 install -r requirements.txt
 echo -e "${GREEN}✅ All Python dependencies installed${NC}"
 
 echo
-echo -e "${BLUE}📋 Step 4: Making scripts executable...${NC}"
+echo -e "${BLUE}📋 Step 4: Building FluidAudio ASR sidecar (Swift)...${NC}"
+echo
+
+if command -v swift &> /dev/null; then
+    SWIFT_VER="$(swift --version 2>&1 | head -1)"
+    echo -e "${GREEN}✅ Swift found: ${SWIFT_VER}${NC}"
+    if xcodebuild -version &> /dev/null; then
+        echo "   $(xcodebuild -version | head -1)"
+    else
+        echo -e "${YELLOW}⚠️  Full Xcode.app not selected (xcodebuild unavailable).${NC}"
+        echo "   FluidAudio needs the macOS SDK C++ headers — install Xcode 15+ and run:"
+        echo "     sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+    fi
+    chmod +x build_asr.sh
+    if ./build_asr.sh > /dev/null; then
+        echo -e "${GREEN}✅ ASR sidecar built${NC}"
+        echo -e "${YELLOW}   First transcription run downloads ~2.5 GB to ~/Library/Caches/FluidAudio/${NC}"
+    else
+        echo -e "${YELLOW}⚠️  ASR sidecar build failed (non-fatal if you use asr_backend: mlx)${NC}"
+    fi
+else
+    echo -e "${YELLOW}⚠️  Swift not found — skipping ASR sidecar build.${NC}"
+    echo "   Install Xcode 15+ for FluidAudio, or set asr_backend: mlx in config.yaml"
+fi
+
+echo
+echo -e "${BLUE}📋 Step 5: Making scripts executable...${NC}"
 echo
 
 chmod +x transcribe.py
@@ -98,7 +124,7 @@ chmod +x detect_key.py
 echo -e "${GREEN}✅ Scripts are now executable${NC}"
 
 echo
-echo -e "${BLUE}📋 Step 5: Creating command alias (optional)...${NC}"
+echo -e "${BLUE}📋 Step 6: Creating command alias (optional)...${NC}"
 echo
 
 # Detect shell

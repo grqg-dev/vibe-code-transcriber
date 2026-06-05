@@ -1,6 +1,18 @@
 # Voice Transcriber Configuration
 
+# ASR backend:
+#   fluidaudio - CoreML via long-lived Swift sidecar (default on this branch)
+#   mlx        - parakeet-mlx in-process on the worker thread (fallback)
+asr_backend: fluidaudio
+
+# FluidAudio Parakeet version (English-only v2 is Starling's EN pick; v3 is multilingual)
+asr_model_version: v2
+
+# Optional override for the built sidecar binary (default: ./asr_sidecar/.build/release/asr-sidecar)
+# asr_sidecar_path: /path/to/asr-sidecar
+
 # Parakeet ASR model to use (Apple Silicon / MLX flavor on Hugging Face)
+# Only used when asr_backend: mlx
 # Popular options:
 #   mlx-community/parakeet-tdt-0.6b-v3   - Recommended, fast and accurate
 #   mlx-community/parakeet-tdt-0.6b-v2   - Older v2 weights

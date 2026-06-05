@@ -4,9 +4,10 @@ A push-to-talk voice transcription tool for macOS on Apple Silicon. Hold a
 key, speak, release — the transcription is dropped into your clipboard and
 auto-pasted at the cursor. 100% local: speech never leaves the machine.
 
-Powered by NVIDIA's Parakeet ASR models running natively on Apple Silicon via
-[parakeet-mlx](https://github.com/senstella/parakeet-mlx) (MLX, not PyTorch —
-fast cold start, no CUDA, no torch).
+Default ASR uses NVIDIA Parakeet via [FluidAudio](https://github.com/FluidInference/FluidAudio)
+(CoreML on the Apple Neural Engine) in a long-lived Swift sidecar. Optional
+fallback: [parakeet-mlx](https://github.com/senstella/parakeet-mlx) on the
+GPU (`asr_backend: mlx` in `config.yaml`).
 
 ---
 
@@ -36,10 +37,14 @@ fast cold start, no CUDA, no torch).
 
 ## 📦 Requirements
 
-- **macOS on Apple Silicon** (M1 / M2 / M3 / …). The MLX runtime is Apple-only.
+- **macOS 14+ on Apple Silicon** (M1 / M2 / M3 / …).
 - **Python 3.9+** (tested on 3.13).
+- **Xcode 15+ / Swift 6** to build the FluidAudio sidecar (`./build_asr.sh`).
+  FluidAudio links C++ helpers — the Command Line Tools alone are not enough;
+  install full Xcode and run `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`.
 - **ffmpeg + portaudio** (installed by `install.sh` via Homebrew).
-- **~1 GB free disk** for the model cache (`~/.cache/huggingface/`).
+- **~2.5 GB free disk** for FluidAudio model cache (`~/Library/Caches/FluidAudio/`)
+  on first run; MLX fallback uses ~600 MB under `~/.cache/huggingface/`.
 - **Microphone + Accessibility permissions** (macOS will prompt on first run).
 
 ---
@@ -53,8 +58,10 @@ cd vibe-code-transcriber
 ./run.sh -v     # same, with verbose diagnostics
 ```
 
-First run downloads the model (~600 MB) and warms it up. Subsequent runs are
-fast — the model is cached at `~/.cache/huggingface/`.
+First run downloads Parakeet CoreML weights (~2.5 GB) into
+`~/Library/Caches/FluidAudio/` and warms the sidecar. Subsequent runs are fast.
+Use `asr_backend: mlx` in `config.yaml` if you prefer the lighter MLX path
+(~600 MB Hugging Face cache).
 
 When you see `✅ Ready! Press and hold the dictation key to start...`, hold
 the configured hotkey (default `alt_r`, i.e. right-option), speak, release.
@@ -68,7 +75,9 @@ the hotkey usually needs tweaking.
 
 | Key | Default | What it does |
 |---|---|---|
-| `parakeet_model` | `mlx-community/parakeet-tdt-0.6b-v3` | HuggingFace model ID. See [models](#parakeet-models). |
+| `asr_backend` | `fluidaudio` | `fluidaudio` (CoreML sidecar) or `mlx` (parakeet-mlx). CLI: `--backend`. |
+| `asr_model_version` | `v2` | FluidAudio Parakeet version: `v2` (English) or `v3` (multilingual). CLI: `--model-version`. |
+| `parakeet_model` | `mlx-community/parakeet-tdt-0.6b-v3` | HuggingFace model ID when `asr_backend: mlx`. See [models](#parakeet-models). |
 | `hotkey_code` | `'alt_r'` | Either a pynput Key name (`'alt_r'`, `'f13'`, `'shift'`, `'ctrl'`, `'cmd'`) **or** a numeric VK code (e.g. `176` for the macOS Fn-dictation key, if you've remapped it). Use `python detect_key.py` to discover what your keys emit. |
 | `auto_paste` | `true` | After transcription, simulate ⌘V at the current cursor. |
 | `audio_feedback` | `true` | Play start/stop beeps. |

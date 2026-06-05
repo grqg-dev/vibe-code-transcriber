@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 Voice Transcriber - Push-to-talk terminal transcription tool
-Hold dictation key to record, release to transcribe with NVIDIA Parakeet
-running natively on Apple Silicon via the MLX framework (parakeet-mlx).
+Hold dictation key to record, release to transcribe locally on Apple Silicon.
+
+Default ASR: FluidAudio (CoreML / ANE) via a long-lived Swift sidecar.
+Fallback: parakeet-mlx (MLX GPU) on the dedicated worker thread.
 """
 
 import pyaudio
@@ -47,6 +49,11 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 # Verbose debug logging — toggle with --verbose flag or VERBOSE=1 env var
 VERBOSE = os.environ.get("VERBOSE", "0") == "1"
 
+# Default path for the FluidAudio sidecar binary (built by build_asr.sh).
+ASR_SIDECAR_DEFAULT = (
+    Path(__file__).parent / "asr_sidecar" / ".build" / "release" / "asr-sidecar"
+)
+
 def _timestamp():
     """Wall clock for verbose debug lines."""
     now = datetime.now()
@@ -77,7 +84,9 @@ class VoiceTranscriber:
 
     def __init__(self, config_path="config.yaml", real_time_mode=False,
                  indicator_style_override=None,
-                 indicator_anchor_override=None):
+                 indicator_anchor_override=None,
+                 asr_backend_override=None,
+                 asr_model_version_override=None):
         # Load configuration
         self.config = self.load_config(config_path)
 
@@ -107,9 +116,38 @@ class VoiceTranscriber:
         self.CHANNELS = self.config['audio']['channels']
         self.RATE = self.config['audio']['sample_rate']
 
-        # Parakeet ASR model (will be loaded on first use)
+        # ASR backend: fluidaudio (Swift sidecar) or mlx (parakeet-mlx worker).
+        self.asr_backend = (
+            asr_backend_override
+            or self.config.get('asr_backend', 'fluidaudio')
+        )
+        if self.asr_backend not in ('fluidaudio', 'mlx'):
+            print(f"⚠️  Unknown asr_backend {self.asr_backend!r}, "
+                  f"falling back to 'fluidaudio'", flush=True)
+            self.asr_backend = 'fluidaudio'
+        self.asr_model_version = (
+            asr_model_version_override
+            or self.config.get('asr_model_version', 'v2')
+        )
+        if self.asr_model_version not in ('v2', 'v3'):
+            print(f"⚠️  Unknown asr_model_version {self.asr_model_version!r}, "
+                  f"falling back to 'v2'", flush=True)
+            self.asr_model_version = 'v2'
+        sidecar_cfg = self.config.get('asr_sidecar_path')
+        self.asr_sidecar_path = (
+            Path(sidecar_cfg) if sidecar_cfg else ASR_SIDECAR_DEFAULT
+        )
+
+        # Parakeet MLX model (mlx backend only; loaded on worker thread).
         self.model = None
         self.model_name = self.config['parakeet_model']
+
+        # FluidAudio sidecar subprocess + request/response pairing.
+        self._asr = None
+        self._asr_request_id = 0
+        self._asr_pending = {}
+        self._asr_lock = threading.Lock()
+        self._asr_reader_thread = None
 
         # Persistent input stream (opened in run())
         self.stream = None
@@ -238,6 +276,8 @@ class VoiceTranscriber:
     def get_default_config(self):
         """Return default configuration"""
         return {
+            'asr_backend': 'fluidaudio',
+            'asr_model_version': 'v2',
             'parakeet_model': 'mlx-community/parakeet-tdt-0.6b-v3',
             'auto_paste': True,
             'audio_feedback': True,
@@ -442,6 +482,179 @@ class VoiceTranscriber:
         if hasattr(result, "text"):
             return (result.text or "").strip()
         return str(result).strip()
+
+    def _resolve_asr_sidecar_bin(self):
+        """Return the sidecar executable path, or None if missing."""
+        path = self.asr_sidecar_path
+        if path.is_file() and os.access(path, os.X_OK):
+            return path
+        return None
+
+    def _spawn_asr_sidecar(self):
+        """Launch the FluidAudio sidecar and block until it emits ready."""
+        bin_path = self._resolve_asr_sidecar_bin()
+        if bin_path is None:
+            print("❌ ASR sidecar binary not found.", flush=True)
+            print(f"   Expected: {self.asr_sidecar_path}", flush=True)
+            print("   Build it: ./build_asr.sh", flush=True)
+            print("   Requires Xcode 15+ (Swift 6) with the macOS SDK.", flush=True)
+            print("   Or set asr_backend: mlx in config.yaml to use parakeet-mlx.", flush=True)
+            os._exit(1)
+
+        print(f"⏳ Loading FluidAudio Parakeet ({self.asr_model_version})...", flush=True)
+        print("   (First run downloads ~2.5 GB to ~/Library/Caches/FluidAudio/)", flush=True)
+
+        self._model_ready.clear()
+        t0 = time.perf_counter()
+        try:
+            self._asr = subprocess.Popen(
+                [str(bin_path), "--model-version", self.asr_model_version],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as e:
+            print(f"❌ Failed to start ASR sidecar: {type(e).__name__}: {e}", flush=True)
+            os._exit(1)
+
+        self._asr_reader_thread = threading.Thread(
+            target=self._asr_stdout_reader, daemon=True
+        )
+        self._asr_reader_thread.start()
+        threading.Thread(target=self._asr_stderr_reader, daemon=True).start()
+
+        if not self._model_ready.wait(timeout=900):
+            print("❌ ASR sidecar did not become ready within 15 minutes.", flush=True)
+            self._shutdown_asr()
+            os._exit(1)
+        dbg_elapsed("ASR sidecar ready", t0)
+        print(f"✅ FluidAudio ready in {time.perf_counter() - t0:.1f}s\n", flush=True)
+
+    def _asr_stderr_reader(self):
+        """Forward sidecar stderr to verbose debug lines."""
+        proc = self._asr
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            for line in proc.stderr:
+                line = line.rstrip()
+                if line:
+                    dbg(f"asr-sidecar: {line}")
+        except Exception as e:
+            dbg(f"asr stderr reader ended: {type(e).__name__}: {e}")
+
+    def _asr_stdout_reader(self):
+        """Parse JSON lines from the sidecar stdout and fulfill pending requests."""
+        proc = self._asr
+        if proc is None or proc.stdout is None:
+            return
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError as e:
+                    dbg(f"asr-sidecar bad JSON: {e}: {line[:120]!r}")
+                    continue
+
+                msg_type = msg.get("type")
+                if msg_type == "ready":
+                    dbg("asr-sidecar sent ready")
+                    self._model_ready.set()
+                    continue
+
+                req_id = msg.get("id")
+                if msg_type in ("result", "error") and req_id is not None:
+                    with self._asr_lock:
+                        pending = self._asr_pending.pop(req_id, None)
+                    if pending is not None:
+                        event, box = pending
+                        box["msg"] = msg
+                        event.set()
+                    else:
+                        dbg(f"asr-sidecar orphan response id={req_id}")
+                else:
+                    dbg(f"asr-sidecar ignored message type={msg_type!r}")
+        except Exception as e:
+            dbg(f"asr stdout reader ended: {type(e).__name__}: {e}")
+        finally:
+            # Wake any blocked transcribe calls so they fail fast.
+            with self._asr_lock:
+                for req_id, (event, box) in list(self._asr_pending.items()):
+                    box["msg"] = {
+                        "type": "error",
+                        "id": req_id,
+                        "message": "ASR sidecar exited",
+                        "ok": False,
+                    }
+                    event.set()
+                self._asr_pending.clear()
+            self._asr = None
+
+    def _transcribe_via_sidecar(self, wav_path):
+        """Ask the FluidAudio sidecar to transcribe a WAV; return (text, processing_s)."""
+        proc = self._asr
+        if proc is None or proc.stdin is None:
+            raise RuntimeError("ASR sidecar is not running")
+
+        with self._asr_lock:
+            self._asr_request_id += 1
+            req_id = self._asr_request_id
+            event = threading.Event()
+            box = {}
+            self._asr_pending[req_id] = (event, box)
+
+        request = {"type": "transcribe", "id": req_id, "path": str(wav_path)}
+        try:
+            proc.stdin.write(json.dumps(request) + "\n")
+            proc.stdin.flush()
+        except BrokenPipeError as e:
+            with self._asr_lock:
+                self._asr_pending.pop(req_id, None)
+            self._asr = None
+            raise RuntimeError("ASR sidecar pipe broken") from e
+
+        if not event.wait(timeout=600):
+            with self._asr_lock:
+                self._asr_pending.pop(req_id, None)
+            raise TimeoutError("ASR sidecar transcription timed out")
+
+        msg = box.get("msg", {})
+        if msg.get("type") == "error" or not msg.get("ok", False):
+            raise RuntimeError(msg.get("message", "ASR sidecar error"))
+
+        text = (msg.get("text") or "").strip()
+        processing_s = float(msg.get("processing_s", 0.0))
+        dbg(
+            f"sidecar transcribe({Path(wav_path).name}): "
+            f"{processing_s:.2f}s processing"
+        )
+        return text, processing_s
+
+    def _shutdown_asr(self):
+        """Tell the ASR sidecar to quit and reap it. Idempotent."""
+        proc = self._asr
+        if proc is None:
+            return
+        try:
+            if proc.stdin is not None:
+                proc.stdin.write('{"type":"quit"}\n')
+                proc.stdin.flush()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            dbg("asr-sidecar didn't quit in time — killing")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        self._asr = None
 
     def start_recording(self):
         """Begin recording. Mic stream is already live — just flip the flag."""
@@ -803,16 +1016,20 @@ class VoiceTranscriber:
         dbg_elapsed("transcribe_audio total", t_total)
 
     def _transcription_worker(self):
-        """Dedicated thread that owns the MLX model and runs all inference.
+        """Dedicated thread that runs all ASR inference.
 
-        MLX GPU streams are per-thread, so the model must be loaded and used
-        from one consistent thread. Producers (the recording flow) hand us
-        WAV paths via self._transcription_queue.
+        MLX GPU streams are per-thread, so mlx load/inference must stay on this
+        thread. FluidAudio runs in a sidecar; this thread only enqueues IPC.
+        Producers hand us WAV paths via self._transcription_queue.
         """
         dbg("transcription worker thread starting")
         try:
-            self.load_model()
-            self.warmup_model()
+            if self.asr_backend == 'fluidaudio':
+                self._spawn_asr_sidecar()
+            else:
+                self.load_model()
+                self.warmup_model()
+                self._model_ready.set()
         except SystemExit:
             self._model_ready.set()
             return
@@ -823,7 +1040,6 @@ class VoiceTranscriber:
                 traceback.print_exc()
             self._model_ready.set()
             return
-        self._model_ready.set()
         dbg("transcription worker ready")
 
         while True:
@@ -843,7 +1059,9 @@ class VoiceTranscriber:
                 dbg(f"release→worker dequeue: {release_ms:.1f}ms")
             t_job = time.perf_counter()
             try:
-                self._process_transcription(wav_path, release_ms=release_ms)
+                self._process_transcription(
+                    wav_path, audio_s=job["audio_s"], release_ms=release_ms
+                )
             except Exception as e:
                 print(f"❌ Worker transcription error: {type(e).__name__}: {e}", flush=True)
                 if VERBOSE:
@@ -856,7 +1074,7 @@ class VoiceTranscriber:
                 except OSError:
                     pass
 
-    def _process_transcription(self, wav_path, release_ms=None):
+    def _process_transcription(self, wav_path, audio_s=None, release_ms=None):
         """Run inference on a WAV path and emit text + clipboard + paste."""
         t_total = time.perf_counter()
         print("⏳ Processing transcription...", flush=True)
@@ -864,13 +1082,24 @@ class VoiceTranscriber:
             dbg(f"_process_transcription: {release_ms:.1f}ms since key release")
 
         t_infer = time.perf_counter()
-        text = self._transcribe_file(wav_path)
-        transcribe_time = time.perf_counter() - t_infer
-        dbg_elapsed("_process_transcription: MLX inference", t_infer)
+        if self.asr_backend == 'fluidaudio':
+            text, transcribe_time = self._transcribe_via_sidecar(wav_path)
+            dbg_elapsed("_process_transcription: FluidAudio sidecar", t_infer)
+        else:
+            text = self._transcribe_file(wav_path)
+            transcribe_time = time.perf_counter() - t_infer
+            dbg_elapsed("_process_transcription: MLX inference", t_infer)
 
         if not text:
             dbg_elapsed("_process_transcription total (no speech)", t_total)
-            print("⚠️  No speech detected in audio\n", flush=True)
+            if audio_s is not None:
+                print(
+                    f"⚠️  No speech detected "
+                    f"(processed {audio_s:.1f}s of audio in {transcribe_time:.1f}s)\n",
+                    flush=True,
+                )
+            else:
+                print("⚠️  No speech detected in audio\n", flush=True)
             return
 
         print("\n" + "═" * 60)
@@ -878,7 +1107,13 @@ class VoiceTranscriber:
         print("═" * 60)
         print(text)
         print("═" * 60)
-        print(f"⏱️  Transcribed in {transcribe_time:.1f}s")
+        if audio_s is not None:
+            print(
+                f"⏱️  Processed {audio_s:.1f}s of audio in {transcribe_time:.1f}s",
+                flush=True,
+            )
+        else:
+            print(f"⏱️  Transcribed in {transcribe_time:.1f}s", flush=True)
 
         try:
             t_clip = time.perf_counter()
@@ -1329,9 +1564,18 @@ class VoiceTranscriber:
             print("🎤  VOICE TRANSCRIBER")
         print("═" * 60)
 
+        if self.real_time_mode and self.asr_backend != 'mlx':
+            print("❌ Real-time mode requires asr_backend: mlx (parakeet-mlx).", flush=True)
+            print("   FluidAudio sidecar supports batch transcription only.", flush=True)
+            sys.exit(1)
+
         # Show configuration
         print(f"\n📋 Configuration:")
-        print(f"   Model: {self.model_name}")
+        print(f"   ASR backend: {self.asr_backend}")
+        if self.asr_backend == 'fluidaudio':
+            print(f"   FluidAudio model: parakeet {self.asr_model_version}")
+        else:
+            print(f"   MLX model: {self.model_name}")
         if self.real_time_mode:
             print(f"   Mode: Real-time typing")
         else:
@@ -1383,9 +1627,9 @@ class VoiceTranscriber:
         self._capture_thread.start()
         dbg_elapsed("capture thread spawned", t_cap)
 
-        # MLX streams are per-thread, so spin up a dedicated worker that owns
-        # the model from load through inference. Block here until it signals
-        # ready so the user only sees the "Ready" banner once we can transcribe.
+        # Spin up a dedicated worker that owns ASR setup (MLX load or sidecar
+        # spawn). Block until it signals ready so the user only sees "Ready"
+        # once we can transcribe.
         print("", flush=True)
         t_worker = time.perf_counter()
         self._worker_thread = threading.Thread(
@@ -1430,6 +1674,7 @@ class VoiceTranscriber:
                 except Exception:
                     pass
                 self._shutdown_indicator()
+                self._shutdown_asr()
                 if listener is not None:
                     listener.stop()
 
@@ -1453,6 +1698,7 @@ class VoiceTranscriber:
                 pass
             self.restore_system_volume()
             self._shutdown_indicator()
+            self._shutdown_asr()
             if listener is not None:
                 listener.stop()
         except Exception as e:
@@ -1467,6 +1713,7 @@ class VoiceTranscriber:
         self._request_shutdown_fast()
         self.restore_system_volume()
         self._shutdown_indicator()
+        self._shutdown_asr()
         try:
             if self.stream is not None:
                 self.stream.stop_stream()
@@ -1514,6 +1761,18 @@ if __name__ == "__main__":
              '"caret" pops it at the text-insertion caret (Accessibility API, '
              'with mouse as fallback).',
     )
+    parser.add_argument(
+        '--backend',
+        choices=['fluidaudio', 'mlx'],
+        default=None,
+        help='Override asr_backend from config.yaml (fluidaudio or mlx)',
+    )
+    parser.add_argument(
+        '--model-version',
+        choices=['v2', 'v3'],
+        default=None,
+        help='Override asr_model_version for FluidAudio (v2 English, v3 multilingual)',
+    )
 
     args = parser.parse_args()
 
@@ -1527,6 +1786,8 @@ if __name__ == "__main__":
             real_time_mode=args.real_time,
             indicator_style_override=args.style,
             indicator_anchor_override=args.anchor,
+            asr_backend_override=args.backend,
+            asr_model_version_override=args.model_version,
         )
         transcriber.run()
     except KeyboardInterrupt:

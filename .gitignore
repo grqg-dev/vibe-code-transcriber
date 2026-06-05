@@ -36,3 +36,6 @@ build/
 
 # Recording debug dumps
 debug_audio/
+
+# Swift ASR sidecar build artifacts
+asr_sidecar/.build/
