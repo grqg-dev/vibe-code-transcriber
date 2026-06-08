@@ -49,6 +49,19 @@ GPU (`asr_backend: mlx` in `config.yaml`).
 
 ---
 
+## 🧪 Tests
+
+Safety net before refactors. Committed dummy WAVs under `tests/fixtures/audio/`
+(silence, tone, short clip, beep+speech).
+
+```bash
+pip install -r requirements-dev.txt   # once
+./run_tests.sh                        # unit tests (~2s, no models)
+./run_tests.sh --all                  # + MLX + FluidAudio integration (~10s)
+```
+
+---
+
 ## 🚀 Quick Start
 
 ```bash

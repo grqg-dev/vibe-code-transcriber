@@ -486,9 +486,18 @@ class VoiceTranscriber:
     def _resolve_asr_sidecar_bin(self):
         """Return the sidecar executable path, or None if missing."""
         path = self.asr_sidecar_path
-        if path.is_file() and os.access(path, os.X_OK):
+        if not path.is_file():
+            return None
+        if path.suffix == '.py' or os.access(path, os.X_OK):
             return path
         return None
+
+    def _asr_sidecar_argv(self, bin_path):
+        """Build argv for the sidecar process (Swift binary or Python mock)."""
+        args = ["--model-version", self.asr_model_version]
+        if bin_path.suffix == '.py':
+            return [sys.executable, str(bin_path), *args]
+        return [str(bin_path), *args]
 
     def _spawn_asr_sidecar(self):
         """Launch the FluidAudio sidecar and block until it emits ready."""
@@ -508,7 +517,7 @@ class VoiceTranscriber:
         t0 = time.perf_counter()
         try:
             self._asr = subprocess.Popen(
-                [str(bin_path), "--model-version", self.asr_model_version],
+                self._asr_sidecar_argv(bin_path),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -612,7 +621,7 @@ class VoiceTranscriber:
         try:
             proc.stdin.write(json.dumps(request) + "\n")
             proc.stdin.flush()
-        except BrokenPipeError as e:
+        except (BrokenPipeError, ValueError, OSError) as e:
             with self._asr_lock:
                 self._asr_pending.pop(req_id, None)
             self._asr = None

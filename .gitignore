@@ -20,6 +20,7 @@ build/
 
 # Temporary files
 *.wav
+!tests/fixtures/audio/*.wav
 *.tmp
 
 # IDE
@@ -27,6 +28,10 @@ build/
 .idea/
 *.swp
 *.swo
+
+# Test artifacts
+.coverage
+htmlcov/
 
 # Logs
 *.log

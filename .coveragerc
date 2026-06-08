@@ -1,0 +1,14 @@
+[run]
+source = transcribe, indicator
+omit =
+    tests/*
+    scripts/*
+    venv/*
+    asr_sidecar/*
+
+[report]
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    sys\.exit
+    os\._exit

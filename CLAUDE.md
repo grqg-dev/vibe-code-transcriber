@@ -115,6 +115,12 @@ Each one was a real bug in a prior iteration.
 # parse + import sanity (always run after editing transcribe.py)
 python3 -c "import ast; ast.parse(open('transcribe.py').read())"
 
+# unit tests (fast, no models)
+./run_tests.sh
+
+# full suite including MLX + FluidAudio integration
+./run_tests.sh --all
+
 # run
 ./run.sh           # normal
 ./run.sh -v        # verbose: prints every keypress, beep, stream open, worker step
@@ -163,7 +169,10 @@ echo '{"type":"transcribe","id":1,"path":"debug_audio/<any>.wav"}' | ./asr_sidec
 | `build.sh` | PyInstaller bundle into `dist/VoiceTranscriber`. Hidden-imports `parakeet_mlx`, `mlx`. Sidecar binary must ship alongside the app (not bundled here). |
 | `debug_audio/` | Per-recording WAV dumps. Gitignored. |
 
-No tests. Smoke commands above are the closest substitute.
+Pytest suite in `tests/` — run `./run_tests.sh` (unit only) or
+`./run_tests.sh --all` (includes MLX + FluidAudio integration). Committed dummy
+audio lives in `tests/fixtures/audio/`; regenerate with
+`python3 tests/fixtures/generate_audio_fixtures.py`.
 
 ## Threading model
 
